@@ -1182,6 +1182,9 @@ async function main() {
   let lastNodesByLod: Record<number, number> = {};
   let lastTriCount = 0;
   let averageFps = 0;
+  let frameMs = 0;
+  let worstFrameMs = 0;
+  let grassUpdateMs = 0;
   let lastDigSummary = "";
   let lastArchiveSummary = "";
   const currentOverlaySnapshot = (): ClodOverlaySnapshot => ({
@@ -1206,12 +1209,12 @@ async function main() {
       `cut: ${lastRenderedCount} nodes  (${lastLevelSummary})\n` +
       `tris rendered: ${lastTriCount.toLocaleString()}   2:1 forced splits: ${lastForced}   ` +
       `bubble forced splits: ${lastNearFieldForced}   xLOD borders: ${lastCrossLodAdjacencyCount}\n` +
-      `threshold: ${state.thresholdPx.toFixed(2)} px   avg FPS: ${averageFps.toFixed(1)}   ` +
+      `threshold: ${state.thresholdPx.toFixed(2)} px   avg FPS: ${averageFps.toFixed(1)} (frame ${frameMs.toFixed(2)} ms, worst ${worstFrameMs.toFixed(1)} ms)   ` +
       `${state.forceMaxLevel === "auto" ? "" : `forced<=${state.forceMaxLevel}   `}${state.freeze ? "[FROZEN]" : ""}\n` +
       `${polishLine}\n` +
       `worker: parents pending=${pendingParentCount} rebuilt=${pendingParentNodes} ${pendingParentMs.toFixed(0)}ms   ` +
       `colliders loaded=${terrainColliders.loadedPageCount()}${state.clodPerfMode ? "   CLOD PERF" : ""}\n` +
-      `grass: ${state.grassEnabled ? "enabled" : "disabled"} ${state.grassBladeCount.toLocaleString()} blades\n` +
+      `grass: ${state.grassEnabled ? "enabled" : "disabled"} ${state.grassBladeCount.toLocaleString()} blades   update: ${grassUpdateMs.toFixed(2)} ms/frame\n` +
       `brush: ${state.digEnabled ? "on" : "off"}  ${state.brushOp === "add" ? "raise" : "dig"} ${state.brushShape} r=${state.digRadius}  edits=${digEditCount()}\n` +
       `${lastDigSummary ? `last: ${lastDigSummary}\n` : ""}` +
       `${lastArchiveSummary ? `${lastArchiveSummary}\n` : ""}` +
@@ -1402,7 +1405,7 @@ async function main() {
   updateLighting();
   updateSelection();
 
-  const fpsSamples: number[] = [];
+  const frameSamples: number[] = [];
   let lastFrameAt = performance.now();
   let lastFpsRefreshAt = lastFrameAt;
   const updateAverageFps = () => {
@@ -1411,9 +1414,20 @@ async function main() {
     lastFrameAt = now;
     if (dt <= 0) return;
 
-    fpsSamples.push(1000 / dt);
-    if (fpsSamples.length > 120) fpsSamples.shift();
-    averageFps = fpsSamples.reduce((sum, fps) => sum + fps, 0) / fpsSamples.length;
+    // Sample frame *times* (ms), not instantaneous FPS. Averaging 1000/dt biases the
+    // result high (Jensen's inequality); the correct average FPS is 1000 / mean(frameMs).
+    // ms is also the metric to trust when vsync quantizes FPS into 144/72/48 buckets.
+    frameSamples.push(dt);
+    if (frameSamples.length > 120) frameSamples.shift();
+    let sum = 0;
+    let worst = 0;
+    for (const ms of frameSamples) {
+      sum += ms;
+      if (ms > worst) worst = ms;
+    }
+    frameMs = sum / frameSamples.length;
+    worstFrameMs = worst;
+    averageFps = 1000 / frameMs;
 
     if (now - lastFpsRefreshAt >= 250) {
       lastFpsRefreshAt = now;
@@ -2974,7 +2988,12 @@ async function main() {
       }
     }
     const grassCenter = interaction.mode === "playing" ? player.position : controls.target;
+    const grassUpdateStart = performance.now();
     grassSystem.update(elapsedSeconds, grassCenter);
+    // Isolated CPU cost of the grass update (per-frame refreshPatches streaming + uniform
+    // upload), smoothed with an EMA so the overlay reads stably. This is the number that
+    // tells us whether running refreshPatches every frame is actually worth optimizing.
+    grassUpdateMs += ((performance.now() - grassUpdateStart) - grassUpdateMs) * 0.1;
     const grassBladeCount = grassSystem.getBladeCount();
     if (grassBladeCount !== state.grassBladeCount) {
       state.grassBladeCount = grassBladeCount;
