@@ -1,0 +1,35 @@
+{
+  "name": "drusniel-voxels-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Standalone Three.js/TypeScript voxel terrain viewer.",
+  "scripts": {
+    "spike": "tsx src/spike.ts",
+    "build-pages": "tsx src/build.ts",
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "fflate": "^0.8.3",
+    "js-yaml": "^4.1.0",
+    "lil-gui": "^0.19.2",
+    "meshoptimizer": "0.22.0",
+    "three": "^0.169.0",
+    "three-mesh-bvh": "^0.9.10"
+  },
+  "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^20.16.0",
+    "@types/three": "^0.169.0",
+    "@vitest/coverage-v8": "^4.1.5",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vite": "^5.4.0",
+    "vitest": "^4.1.5"
+  }
+}
