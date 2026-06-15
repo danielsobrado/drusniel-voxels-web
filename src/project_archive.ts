@@ -10,6 +10,7 @@ const IMPORT_STORE = "projects";
 
 export type TextureBlendMode = "hard bands" | "blend bands";
 export type PostProcessDebugMode = "output" | "copy" | "off";
+export type GrassShaderMode = "classic" | "terrain-patch-v2";
 
 export interface ProjectSessionState {
   thresholdPx: number;
@@ -69,6 +70,7 @@ export interface ProjectSessionState {
   brushFalloff: number;
   brushFlowMs: number;
   grassEnabled: boolean;
+  grassShaderMode: GrassShaderMode;
   grassDistance: number;
   grassBladeSpacing: number;
   grassBladeHeight: number;
@@ -200,6 +202,12 @@ function assertSessionState(value: unknown): asserts value is ProjectSessionStat
   }
   if (!["output", "copy", "off"].includes(String(value.postProcessDebugMode))) {
     throw new Error("project.json has an invalid postProcessDebugMode");
+  }
+  if (value.grassShaderMode === undefined) {
+    value.grassShaderMode = "classic";
+  }
+  if (!["classic", "terrain-patch-v2"].includes(String(value.grassShaderMode))) {
+    throw new Error("project.json has an invalid grassShaderMode");
   }
   if (!["remove", "add"].includes(String(value.brushOp))) {
     throw new Error("project.json has an invalid brushOp");

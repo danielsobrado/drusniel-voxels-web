@@ -1,6 +1,3 @@
-// Per-frame DAG-cut selection (errorPx + hysteresis + optional 2:1), debug overlays,
-// per-node screen labels and locked-border highlights.
-
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import GUI from "lil-gui";
@@ -34,6 +31,7 @@ import {
   GrassSystem,
   type GrassLighting,
   type GrassSettings,
+  type GrassStats,
 } from "./grass.js";
 import {
   DEFAULT_PLAYER_CONFIG,
@@ -752,6 +750,7 @@ async function main() {
     audioEnabled: getAudioState().enabled,
     audioVolume: getAudioState().masterVolume,
     grassEnabled: false,
+    grassShaderMode: DEFAULT_GRASS_SETTINGS.shaderMode,
     grassDistance: DEFAULT_GRASS_SETTINGS.distance,
     grassBladeSpacing: DEFAULT_GRASS_SETTINGS.bladeSpacing,
     grassBladeHeight: DEFAULT_GRASS_SETTINGS.bladeHeight,
@@ -765,6 +764,10 @@ async function main() {
     grassMaxBlades: DEFAULT_GRASS_SETTINGS.maxBlades,
     grassSeed: DEFAULT_GRASS_SETTINGS.seed,
     grassBladeCount: 0,
+    grassVisiblePatches: "0/0",
+    grassTierSummary: "0/0/0",
+    grassEdgeSuppressed: 0,
+    grassCandidateCount: 0,
   };
   if (stagedImport) Object.assign(state, stagedImport.manifest.state);
   if (queryPerfMode) {
@@ -1054,6 +1057,7 @@ async function main() {
 
   const makeGrassSettings = (): GrassSettings => ({
     enabled: state.grassEnabled,
+    shaderMode: state.grassShaderMode,
     distance: state.grassDistance,
     bladeSpacing: state.grassBladeSpacing,
     bladeHeight: state.grassBladeHeight,
@@ -1077,6 +1081,7 @@ async function main() {
     };
   };
   let grass: GrassSystem | null = null;
+  let grassStats: GrassStats | null = null;
   let selState: SelectionState = { split: new Set() };
   const pageTransitionMode = cfg.selection.transition_mode;
   const crossfadeStep = cfg.selection.crossfade_frames > 0
@@ -1110,6 +1115,7 @@ async function main() {
   });
   grass = grassSystem;
   state.grassBladeCount = grassSystem.getBladeCount();
+  grassStats = grassSystem.getStats();
 
   const rebuildDebugOverlays = (rendered: ClodPageNode[], xLodAdjacencies: CrossLodAdjacency[]) => {
     boundaryGroup.clear();
@@ -1182,9 +1188,6 @@ async function main() {
   let lastNodesByLod: Record<number, number> = {};
   let lastTriCount = 0;
   let averageFps = 0;
-  let frameMs = 0;
-  let worstFrameMs = 0;
-  let grassUpdateMs = 0;
   let lastDigSummary = "";
   let lastArchiveSummary = "";
   const currentOverlaySnapshot = (): ClodOverlaySnapshot => ({
@@ -1205,16 +1208,20 @@ async function main() {
       ? `player: grounded=${player.grounded}  physics p95=${player.physicsP95Ms().toFixed(2)} ms  collider pages=${player.lastPagesTested}`
       : `view: ${interaction.mode}`;
     info.textContent =
-      `CLOD Pages runtime - ${WORLD}x${WORLD} pages\n` +
+      `Drusniel Voxels Web — ${WORLD}x${WORLD} pages\n` +
       `cut: ${lastRenderedCount} nodes  (${lastLevelSummary})\n` +
       `tris rendered: ${lastTriCount.toLocaleString()}   2:1 forced splits: ${lastForced}   ` +
       `bubble forced splits: ${lastNearFieldForced}   xLOD borders: ${lastCrossLodAdjacencyCount}\n` +
-      `threshold: ${state.thresholdPx.toFixed(2)} px   avg FPS: ${averageFps.toFixed(1)} (frame ${frameMs.toFixed(2)} ms, worst ${worstFrameMs.toFixed(1)} ms)   ` +
+      `threshold: ${state.thresholdPx.toFixed(2)} px   avg FPS: ${averageFps.toFixed(1)}   ` +
       `${state.forceMaxLevel === "auto" ? "" : `forced<=${state.forceMaxLevel}   `}${state.freeze ? "[FROZEN]" : ""}\n` +
       `${polishLine}\n` +
       `worker: parents pending=${pendingParentCount} rebuilt=${pendingParentNodes} ${pendingParentMs.toFixed(0)}ms   ` +
       `colliders loaded=${terrainColliders.loadedPageCount()}${state.clodPerfMode ? "   CLOD PERF" : ""}\n` +
-      `grass: ${state.grassEnabled ? "enabled" : "disabled"} ${state.grassBladeCount.toLocaleString()} blades   update: ${grassUpdateMs.toFixed(2)} ms/frame\n` +
+      `grass: ${state.grassEnabled ? "enabled" : "disabled"} ${state.grassShaderMode} ` +
+      `${state.grassBladeCount.toLocaleString()} blades` +
+      `${grassStats ? ` patches=${grassStats.visiblePatches}/${grassStats.patches} ` +
+      `tiers n/m/c=${grassStats.nearPatches}/${grassStats.midPatches}/${grassStats.coveragePatches} ` +
+      `edge-skip=${grassStats.edgeSuppressedCandidates}` : ""}\n` +
       `brush: ${state.digEnabled ? "on" : "off"}  ${state.brushOp === "add" ? "raise" : "dig"} ${state.brushShape} r=${state.digRadius}  edits=${digEditCount()}\n` +
       `${lastDigSummary ? `last: ${lastDigSummary}\n` : ""}` +
       `${lastArchiveSummary ? `${lastArchiveSummary}\n` : ""}` +
@@ -1373,8 +1380,7 @@ async function main() {
       for (const node of lod0.changed) colliderMs += applyNodeMesh(node);
       if (state.grassEnabled && lod0.changed.length > 0) {
         grassSystem.rebuildNodePatches(lod0.changed.map((node) => node.id));
-        state.grassBladeCount = grassSystem.getBladeCount();
-        grassBladeCountController?.updateDisplay();
+        refreshGrassStats();
       }
       pendingParentNodes = 0;
       pendingParentMs = 0;
@@ -1405,7 +1411,7 @@ async function main() {
   updateLighting();
   updateSelection();
 
-  const frameSamples: number[] = [];
+  const fpsSamples: number[] = [];
   let lastFrameAt = performance.now();
   let lastFpsRefreshAt = lastFrameAt;
   const updateAverageFps = () => {
@@ -1414,20 +1420,9 @@ async function main() {
     lastFrameAt = now;
     if (dt <= 0) return;
 
-    // Sample frame *times* (ms), not instantaneous FPS. Averaging 1000/dt biases the
-    // result high (Jensen's inequality); the correct average FPS is 1000 / mean(frameMs).
-    // ms is also the metric to trust when vsync quantizes FPS into 144/72/48 buckets.
-    frameSamples.push(dt);
-    if (frameSamples.length > 120) frameSamples.shift();
-    let sum = 0;
-    let worst = 0;
-    for (const ms of frameSamples) {
-      sum += ms;
-      if (ms > worst) worst = ms;
-    }
-    frameMs = sum / frameSamples.length;
-    worstFrameMs = worst;
-    averageFps = 1000 / frameMs;
+    fpsSamples.push(1000 / dt);
+    if (fpsSamples.length > 120) fpsSamples.shift();
+    averageFps = fpsSamples.reduce((sum, fps) => sum + fps, 0) / fpsSamples.length;
 
     if (now - lastFpsRefreshAt >= 250) {
       lastFpsRefreshAt = now;
@@ -1621,12 +1616,28 @@ async function main() {
   };
   postFolder.add(postActions, "reset").name("reset");
   let grassBladeCountController: { updateDisplay: () => unknown } | null = null;
+  let grassVisiblePatchesController: { updateDisplay: () => unknown } | null = null;
+  let grassTierSummaryController: { updateDisplay: () => unknown } | null = null;
+  let grassEdgeSuppressedController: { updateDisplay: () => unknown } | null = null;
+  let grassCandidateCountController: { updateDisplay: () => unknown } | null = null;
+  const refreshGrassStats = () => {
+    grassStats = grassSystem.getStats();
+    state.grassBladeCount = grassStats.blades;
+    state.grassVisiblePatches = `${grassStats.visiblePatches}/${grassStats.patches}`;
+    state.grassTierSummary = `${grassStats.nearPatches}/${grassStats.midPatches}/${grassStats.coveragePatches}`;
+    state.grassEdgeSuppressed = grassStats.edgeSuppressedCandidates;
+    state.grassCandidateCount = grassStats.generatedCandidates;
+    grassBladeCountController?.updateDisplay();
+    grassVisiblePatchesController?.updateDisplay();
+    grassTierSummaryController?.updateDisplay();
+    grassEdgeSuppressedController?.updateDisplay();
+    grassCandidateCountController?.updateDisplay();
+  };
   const grassActions = {
     rebuild: () => {
       grassSystem.updateSettings(makeGrassSettings());
       grassSystem.rebuild();
-      state.grassBladeCount = grassSystem.getBladeCount();
-      grassBladeCountController?.updateDisplay();
+      refreshGrassStats();
       updateInfo();
     },
   };
@@ -1634,8 +1645,10 @@ async function main() {
   const grassFolder = gui.addFolder("grass shader");
   grassFolder.add(state, "grassEnabled").name("enabled").onChange((enabled: boolean) => {
     grassSystem.setEnabled(enabled);
+    refreshGrassStats();
     updateInfo();
   });
+  grassFolder.add(state, "grassShaderMode", ["classic", "terrain-patch-v2"]).name("shader").onChange(grassActions.rebuild);
   grassFolder.add(state, "grassDistance", 16, 512, 1).name("distance").onChange(updateGrassUniforms);
   grassFolder.add(state, "grassBladeSpacing", 0.4, 6, 0.1).name("blade spacing").onFinishChange(grassActions.rebuild);
   grassFolder.add(state, "grassBladeHeight", 0.2, 4, 0.05).name("blade height").onFinishChange(grassActions.rebuild);
@@ -1649,6 +1662,10 @@ async function main() {
   grassFolder.add(state, "grassMaxBlades", 0, 100000, 1000).name("max blades").onFinishChange(grassActions.rebuild);
   grassFolder.add(state, "grassSeed", 0, 100000, 1).name("seed").onFinishChange(grassActions.rebuild);
   grassBladeCountController = grassFolder.add(state, "grassBladeCount").name("blade count").disable();
+  grassVisiblePatchesController = grassFolder.add(state, "grassVisiblePatches").name("visible patches").disable();
+  grassTierSummaryController = grassFolder.add(state, "grassTierSummary").name("near/mid/coverage").disable();
+  grassEdgeSuppressedController = grassFolder.add(state, "grassEdgeSuppressed").name("edge suppressed").disable();
+  grassCandidateCountController = grassFolder.add(state, "grassCandidateCount").name("candidates").disable();
   grassFolder.add(grassActions, "rebuild").name("rebuild");
   const textureInput = document.createElement("input");
   textureInput.type = "file";
@@ -2692,6 +2709,7 @@ async function main() {
     brushFalloff: state.brushFalloff,
     brushFlowMs: state.brushFlowMs,
     grassEnabled: state.grassEnabled,
+    grassShaderMode: state.grassShaderMode,
     grassDistance: state.grassDistance,
     grassBladeSpacing: state.grassBladeSpacing,
     grassBladeHeight: state.grassBladeHeight,
@@ -2891,6 +2909,7 @@ async function main() {
   applyTerrainTextures();
   grassSystem.setEnabled(state.grassEnabled);
   grassSystem.updateSettings(makeGrassSettings());
+  refreshGrassStats();
   updateSelection();
   updateInfo();
 
@@ -2988,16 +3007,30 @@ async function main() {
       }
     }
     const grassCenter = interaction.mode === "playing" ? player.position : controls.target;
-    const grassUpdateStart = performance.now();
     grassSystem.update(elapsedSeconds, grassCenter);
-    // Isolated CPU cost of the grass update (per-frame refreshPatches streaming + uniform
-    // upload), smoothed with an EMA so the overlay reads stably. This is the number that
-    // tells us whether running refreshPatches every frame is actually worth optimizing.
-    grassUpdateMs += ((performance.now() - grassUpdateStart) - grassUpdateMs) * 0.1;
-    const grassBladeCount = grassSystem.getBladeCount();
-    if (grassBladeCount !== state.grassBladeCount) {
-      state.grassBladeCount = grassBladeCount;
+    const nextGrassStats = grassSystem.getStats();
+    if (
+      !grassStats ||
+      nextGrassStats.blades !== grassStats.blades ||
+      nextGrassStats.visiblePatches !== grassStats.visiblePatches ||
+      nextGrassStats.patches !== grassStats.patches ||
+      nextGrassStats.nearPatches !== grassStats.nearPatches ||
+      nextGrassStats.midPatches !== grassStats.midPatches ||
+      nextGrassStats.coveragePatches !== grassStats.coveragePatches ||
+      nextGrassStats.edgeSuppressedCandidates !== grassStats.edgeSuppressedCandidates ||
+      nextGrassStats.generatedCandidates !== grassStats.generatedCandidates
+    ) {
+      grassStats = nextGrassStats;
+      state.grassBladeCount = nextGrassStats.blades;
+      state.grassVisiblePatches = `${nextGrassStats.visiblePatches}/${nextGrassStats.patches}`;
+      state.grassTierSummary = `${nextGrassStats.nearPatches}/${nextGrassStats.midPatches}/${nextGrassStats.coveragePatches}`;
+      state.grassEdgeSuppressed = nextGrassStats.edgeSuppressedCandidates;
+      state.grassCandidateCount = nextGrassStats.generatedCandidates;
       grassBladeCountController?.updateDisplay();
+      grassVisiblePatchesController?.updateDisplay();
+      grassTierSummaryController?.updateDisplay();
+      grassEdgeSuppressedController?.updateDisplay();
+      grassCandidateCountController?.updateDisplay();
     }
     nodeLabelOverlay.update({
       nodes: lastRenderedNodes,

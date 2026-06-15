@@ -58,6 +58,23 @@ describe("grass placement", () => {
     expect(generateGrassInstances(footprint, settings, 7)).toHaveLength(7);
   });
 
+  it("terrain-patch-v2 records generation stats and respects the blade budget", () => {
+    const stats = { generatedCandidates: 0, acceptedCandidates: 0, edgeSuppressedCandidates: 0 };
+    const blades = generateGrassInstances(
+      footprint,
+      { ...settings, shaderMode: "terrain-patch-v2" },
+      11,
+      stats,
+    );
+    expect(blades.length).toBeLessThanOrEqual(11);
+    expect(stats.generatedCandidates).toBeGreaterThan(0);
+    expect(stats.acceptedCandidates).toBeGreaterThanOrEqual(blades.length);
+    for (const blade of blades) {
+      expect(blade.edgeFade).toBeGreaterThanOrEqual(0.18);
+      expect(blade.normalY).toBeGreaterThanOrEqual(settings.slopeMinY);
+    }
+  });
+
   afterEach(() => {
     clearDigEdits();
   });
