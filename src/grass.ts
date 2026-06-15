@@ -323,9 +323,9 @@ export const DEFAULT_GRASS_SETTINGS: GrassSettings = {
   windStrength: 0.32,
   windSpeed: 1.35,
   slopeMinY: 0.72,
-  minHeight: 20,
-  maxHeight: 86,
-  maxBlades: 35000,
+  minHeight: 12,
+  maxHeight: 24,
+  maxBlades: 48000,
   seed: 1337,
 };
 
