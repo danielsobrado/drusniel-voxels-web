@@ -19,7 +19,9 @@ const V2_MID_BLADE_ROWS = [
   [0, 0.78],
   [1, 0],
 ] as const;
-const GRASS_SHADER_MODES = ["classic", "terrain-patch-v2"] as const;
+export const GRASS_SHADER_MODES = ["terrain-patch-v2", "classic"] as const;
+export type GrassShaderMode = typeof GRASS_SHADER_MODES[number];
+export const DEFAULT_GRASS_SHADER_MODE: GrassShaderMode = "terrain-patch-v2";
 const V2_NEAR_DISTANCE_FRACTION = 0.42;
 const V2_MID_DISTANCE_FRACTION = 0.78;
 const V2_MID_INSTANCE_FRACTION = 0.35;
@@ -183,10 +185,26 @@ const TERRAIN_PATCH_FRAGMENT_SHADER = /* glsl */ `
   varying float vEdgeFade;
   varying float vDistanceFade;
   varying vec3 vWorldNormal;
+  uniform float uAlphaToCoverage;
+
+  // Ordered-dither fallback (used when alpha-to-coverage is off). Recursive 2x2 -> 4x4 Bayer
+  // matrix in [0,1), no array indexing so it stays WebGL1-safe.
+  float bayer2(vec2 a) {
+    a = floor(a);
+    return fract(a.x * 0.5 + a.y * a.y * 0.75);
+  }
+  float bayer4(vec2 a) {
+    return bayer2(a * 0.5) * 0.25 + bayer2(a);
+  }
 
   void main() {
-    float alpha = smoothstep(0.0, 0.08, vDistanceFade) * smoothstep(0.08, 0.45, vEdgeFade);
-    if (alpha < 0.03) discard;
+    // Soft coverage from the distance + edge fades. Both paths stay in the OPAQUE pass
+    // (early-Z, no blended overdraw): alpha-to-coverage emits coverage as alpha so the MSAA
+    // hardware builds a smooth sample mask; the fallback is an ordered screen-door cutout.
+    float coverage = smoothstep(0.0, 0.08, vDistanceFade) * smoothstep(0.08, 0.45, vEdgeFade);
+    bool a2c = uAlphaToCoverage > 0.5;
+    float cutoff = a2c ? 0.003 : bayer4(gl_FragCoord.xy);
+    if (coverage < cutoff) discard;
 
     vec3 base = vec3(0.04, 0.16, 0.035);
     vec3 mid = vec3(0.16, 0.36, 0.075);
@@ -205,7 +223,7 @@ const TERRAIN_PATCH_FRAGMENT_SHADER = /* glsl */ `
     vec3 hemi = mix(uGroundLight, uSkyLight, sky);
     vec3 direct = uSunColor * (sun * 0.65 + wrap * 0.28);
     vec3 transmission = vec3(0.42, 0.52, 0.12) * max(dot(-n, lightDirection), 0.0) * (0.14 + vUv.y * 0.42);
-    gl_FragColor = vec4(color * (hemi + direct) + transmission * color, alpha);
+    gl_FragColor = vec4(color * (hemi + direct) + transmission * color, a2c ? coverage : 1.0);
     #include <tonemapping_fragment>
     #include <colorspace_fragment>
   }
@@ -214,6 +232,7 @@ const TERRAIN_PATCH_FRAGMENT_SHADER = /* glsl */ `
 export interface GrassSettings {
   enabled: boolean;
   shaderMode: GrassShaderMode;
+  alphaToCoverage: boolean;
   distance: number;
   bladeSpacing: number;
   bladeHeight: number;
@@ -227,8 +246,6 @@ export interface GrassSettings {
   maxBlades: number;
   seed: number;
 }
-
-export type GrassShaderMode = typeof GRASS_SHADER_MODES[number];
 
 export interface GrassLighting {
   light: THREE.Vector3;
@@ -296,7 +313,8 @@ interface GrassPatch {
 
 export const DEFAULT_GRASS_SETTINGS: GrassSettings = {
   enabled: true,
-  shaderMode: "classic",
+  shaderMode: DEFAULT_GRASS_SHADER_MODE,
+  alphaToCoverage: false,
   distance: 96,
   bladeSpacing: 1.6,
   bladeHeight: 1.15,
@@ -313,6 +331,32 @@ export const DEFAULT_GRASS_SETTINGS: GrassSettings = {
 
 export function isGrassShaderMode(value: unknown): value is GrassShaderMode {
   return typeof value === "string" && (GRASS_SHADER_MODES as readonly string[]).includes(value);
+}
+
+interface GrassShaderDefinition {
+  vertexShader: string;
+  fragmentShader: string;
+  patchStyle: "classic" | "terrain-patch";
+  usesTerrainPatchPlacement: boolean;
+}
+
+const GRASS_SHADER_DEFINITIONS: Record<GrassShaderMode, GrassShaderDefinition> = {
+  "terrain-patch-v2": {
+    vertexShader: TERRAIN_PATCH_VERTEX_SHADER,
+    fragmentShader: TERRAIN_PATCH_FRAGMENT_SHADER,
+    patchStyle: "terrain-patch",
+    usesTerrainPatchPlacement: true,
+  },
+  classic: {
+    vertexShader: VERTEX_SHADER,
+    fragmentShader: FRAGMENT_SHADER,
+    patchStyle: "classic",
+    usesTerrainPatchPlacement: false,
+  },
+};
+
+function grassShaderDefinition(mode: GrassShaderMode): GrassShaderDefinition {
+  return GRASS_SHADER_DEFINITIONS[mode];
 }
 
 export function hash2(x: number, z: number, seed: number): number {
@@ -361,7 +405,7 @@ export function generateGrassInstances(
   const columns = Math.max(0, Math.floor((footprint.maxX - footprint.minX) / spacing));
   const rows = Math.max(0, Math.floor((footprint.maxZ - footprint.minZ) / spacing));
   const limit = Math.max(0, Math.floor(maxBlades));
-  const terrainPatchMode = settings.shaderMode === "terrain-patch-v2";
+  const terrainPatchMode = grassShaderDefinition(settings.shaderMode).usesTerrainPatchPlacement;
 
   for (let row = 0; row < rows; row++) {
     for (let column = 0; column < columns; column++) {
@@ -443,6 +487,8 @@ function createGrassMaterial(
   lighting: GrassLighting,
   shaderMode: GrassShaderMode,
 ): THREE.ShaderMaterial {
+  const shader = grassShaderDefinition(shaderMode);
+  const useAlphaToCoverage = shader.patchStyle === "terrain-patch" && settings.alphaToCoverage;
   return new THREE.ShaderMaterial({
     uniforms: {
       uTime: { value: 0 },
@@ -455,12 +501,17 @@ function createGrassMaterial(
       uSunColor: { value: lighting.sunColor.clone() },
       uSkyLight: { value: lighting.skyLight.clone() },
       uGroundLight: { value: lighting.groundLight.clone() },
+      uAlphaToCoverage: { value: useAlphaToCoverage ? 1 : 0 },
     },
-    vertexShader: shaderMode === "terrain-patch-v2" ? TERRAIN_PATCH_VERTEX_SHADER : VERTEX_SHADER,
-    fragmentShader: shaderMode === "terrain-patch-v2" ? TERRAIN_PATCH_FRAGMENT_SHADER : FRAGMENT_SHADER,
+    vertexShader: shader.vertexShader,
+    fragmentShader: shader.fragmentShader,
     side: THREE.DoubleSide,
-    transparent: shaderMode === "terrain-patch-v2",
+    // Both modes stay opaque (no alpha blending => depth-write + early-Z, no overdraw
+    // blow-up). terrain-patch-v2 fades either via hardware alpha-to-coverage (smooth, needs
+    // an MSAA target) or the ordered-dither cutout fallback; classic is fully solid.
+    transparent: false,
     depthWrite: true,
+    alphaToCoverage: useAlphaToCoverage,
     toneMapped: true,
   });
 }
@@ -473,8 +524,7 @@ export class GrassSystem {
   private readonly classicBladeGeometry = createBladeGeometry();
   private readonly terrainPatchNearGeometry = createBladeGeometry(V2_NEAR_BLADE_ROWS);
   private readonly terrainPatchMidGeometry = createBladeGeometry(V2_MID_BLADE_ROWS);
-  private readonly classicMaterial: THREE.ShaderMaterial;
-  private readonly terrainPatchMaterial: THREE.ShaderMaterial;
+  private readonly materials = new Map<GrassShaderMode, THREE.ShaderMaterial>();
   private settings: GrassSettings;
   private patches: GrassPatch[] = [];
   private bladeCount = 0;
@@ -484,7 +534,7 @@ export class GrassSystem {
     edgeSuppressedCandidates: 0,
   };
   private stats: GrassStats = {
-    mode: "classic",
+    mode: DEFAULT_GRASS_SHADER_MODE,
     blades: 0,
     patches: 0,
     visiblePatches: 0,
@@ -506,8 +556,9 @@ export class GrassSystem {
       .sort((a, b) => a.footprint.minZ - b.footprint.minZ || a.footprint.minX - b.footprint.minX);
     this.worldCells = options.worldCells;
     this.settings = { ...options.settings };
-    this.classicMaterial = createGrassMaterial(this.settings, options.lighting, "classic");
-    this.terrainPatchMaterial = createGrassMaterial(this.settings, options.lighting, "terrain-patch-v2");
+    for (const mode of GRASS_SHADER_MODES) {
+      this.materials.set(mode, createGrassMaterial(this.settings, options.lighting, mode));
+    }
     this.lastCenter = new THREE.Vector3(this.worldCells * 0.5, 0, this.worldCells * 0.5);
     this.root.name = "grass";
     this.scene.add(this.root);
@@ -529,7 +580,7 @@ export class GrassSystem {
   }
 
   updateLighting(lighting: GrassLighting): void {
-    for (const material of [this.classicMaterial, this.terrainPatchMaterial]) {
+    for (const material of this.materials.values()) {
       material.uniforms.uLight.value.copy(lighting.light);
       material.uniforms.uSunColor.value.copy(lighting.sunColor);
       material.uniforms.uSkyLight.value.copy(lighting.skyLight);
@@ -538,8 +589,9 @@ export class GrassSystem {
   }
 
   update(timeSeconds: number, center: THREE.Vector3): void {
-    this.classicMaterial.uniforms.uTime.value = timeSeconds;
-    this.terrainPatchMaterial.uniforms.uTime.value = timeSeconds;
+    for (const material of this.materials.values()) {
+      material.uniforms.uTime.value = timeSeconds;
+    }
     this.lastCenter.copy(center);
     if (!this.settings.enabled) {
       this.updateStats();
@@ -583,8 +635,7 @@ export class GrassSystem {
     this.classicBladeGeometry.dispose();
     this.terrainPatchNearGeometry.dispose();
     this.terrainPatchMidGeometry.dispose();
-    this.classicMaterial.dispose();
-    this.terrainPatchMaterial.dispose();
+    for (const material of this.materials.values()) material.dispose();
   }
 
   getBladeCount(): number {
@@ -655,7 +706,8 @@ export class GrassSystem {
   }
 
   private createPatch(nodeId: string, footprint: PageFootprint, instances: GrassBladeInstance[]): GrassPatch {
-    if (this.settings.shaderMode === "terrain-patch-v2") {
+    const shader = grassShaderDefinition(this.settings.shaderMode);
+    if (shader.patchStyle === "terrain-patch") {
       return this.createTerrainPatch(nodeId, footprint, instances);
     }
     const geometry = new THREE.InstancedBufferGeometry();
@@ -666,7 +718,7 @@ export class GrassSystem {
     const radius = Math.hypot(footprint.maxX - footprint.minX, footprint.maxZ - footprint.minZ) * 0.5;
     return {
       nodeId,
-      meshes: [new THREE.Mesh(geometry, this.classicMaterial)],
+      meshes: [new THREE.Mesh(geometry, this.materialFor(this.settings.shaderMode))],
       centerX,
       centerZ,
       radius,
@@ -692,8 +744,9 @@ export class GrassSystem {
     const centerX = (footprint.minX + footprint.maxX) * 0.5;
     const centerZ = (footprint.minZ + footprint.maxZ) * 0.5;
     const radius = Math.hypot(footprint.maxX - footprint.minX, footprint.maxZ - footprint.minZ) * 0.5;
-    const nearMesh = new THREE.Mesh(nearGeometry, this.terrainPatchMaterial);
-    const midMesh = new THREE.Mesh(midGeometry, this.terrainPatchMaterial);
+    const material = this.materialFor(this.settings.shaderMode);
+    const nearMesh = new THREE.Mesh(nearGeometry, material);
+    const midMesh = new THREE.Mesh(midGeometry, material);
     return {
       nodeId,
       meshes: [nearMesh, midMesh],
@@ -756,17 +809,22 @@ export class GrassSystem {
   }
 
   private updateMaterialUniforms(): void {
-    for (const material of [this.classicMaterial, this.terrainPatchMaterial]) {
+    for (const [mode, material] of this.materials) {
       material.uniforms.uBladeWidth.value = this.settings.bladeWidth;
       material.uniforms.uWindStrength.value = this.settings.windStrength;
       material.uniforms.uWindSpeed.value = this.settings.windSpeed;
       material.uniforms.uNearDistance.value = this.settings.distance * V2_NEAR_DISTANCE_FRACTION;
       material.uniforms.uMidDistance.value = this.settings.distance * V2_MID_DISTANCE_FRACTION;
+      // Toggling alpha-to-coverage only flips a material flag + uniform (no recompile/rebuild).
+      const useAlphaToCoverage =
+        grassShaderDefinition(mode).patchStyle === "terrain-patch" && this.settings.alphaToCoverage;
+      material.alphaToCoverage = useAlphaToCoverage;
+      material.uniforms.uAlphaToCoverage.value = useAlphaToCoverage ? 1 : 0;
     }
   }
 
   private updatePatchVisibility(patch: GrassPatch, distance: number): void {
-    if (this.settings.shaderMode !== "terrain-patch-v2") {
+    if (grassShaderDefinition(this.settings.shaderMode).patchStyle !== "terrain-patch") {
       const visible = distance <= this.settings.distance + patch.radius;
       patch.meshes[0].visible = visible;
       patch.visibleTier = visible ? "near" : "hidden";
@@ -790,6 +848,12 @@ export class GrassSystem {
       this.root.remove(mesh);
       mesh.geometry.dispose();
     }
+  }
+
+  private materialFor(mode: GrassShaderMode): THREE.ShaderMaterial {
+    const material = this.materials.get(mode);
+    if (!material) throw new Error(`Missing grass material for shader mode: ${mode}`);
+    return material;
   }
 
   private updateStats(): void {

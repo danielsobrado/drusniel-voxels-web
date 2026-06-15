@@ -48,7 +48,7 @@ const state: ProjectSessionState = {
   bubble: true, bubbleRadius: 64, tintBubble: false, digEnabled: true, digRadius: 4,
   brushOp: "add", brushShape: "cylinder", brushMaterial: 2, brushHeight: 6,
   brushStrength: 0.75, brushFalloff: 0.25, brushFlowMs: 180, grassEnabled: true,
-  grassShaderMode: "terrain-patch-v2",
+  grassShaderMode: "terrain-patch-v2", grassAlphaToCoverage: true,
   grassDistance: 96, grassBladeSpacing: 1.6, grassBladeHeight: 1.15,
   grassBladeHeightVariation: 0.75, grassBladeWidth: 0.08, grassWindStrength: 0.32,
   grassWindSpeed: 1.35, grassSlopeMinY: 0.72, grassMinHeight: 20, grassMaxHeight: 86,

@@ -7,8 +7,20 @@ import viteConfig from "../vite.config.js";
 const projectRoot = resolve(import.meta.dirname, "..");
 
 describe("GitHub Pages deployment contract", () => {
-  it("builds assets beneath the repository project path", () => {
-    expect(viteConfig).toMatchObject({ base: "/drusniel-voxels-web/" });
+  it("builds assets beneath the repository project path", async () => {
+    // Config is command-aware (root base in dev, repo sub-path for builds). The deployment
+    // contract is about the production build, so resolve it for the "build" command.
+    const built = await (typeof viteConfig === "function"
+      ? viteConfig({ command: "build", mode: "production" })
+      : viteConfig);
+    expect(built).toMatchObject({ base: "/drusniel-voxels-web/" });
+  });
+
+  it("serves dev from root so the local URL needs no base path", async () => {
+    const served = await (typeof viteConfig === "function"
+      ? viteConfig({ command: "serve", mode: "development" })
+      : viteConfig);
+    expect(served).toMatchObject({ base: "/" });
   });
 
   it("provides standard static build and preview scripts", () => {

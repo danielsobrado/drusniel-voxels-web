@@ -1,6 +1,8 @@
 import { describe, expect, it, afterEach } from "vitest";
 import {
+  DEFAULT_GRASS_SHADER_MODE,
   DEFAULT_GRASS_SETTINGS,
+  GRASS_SHADER_MODES,
   acceptsGrassCandidate,
   generateGrassInstances,
   type GrassSettings,
@@ -19,6 +21,12 @@ const settings: GrassSettings = {
 };
 
 describe("grass placement", () => {
+  it("defaults to the terrain patch shader while retaining the classic shader option", () => {
+    expect(DEFAULT_GRASS_SHADER_MODE).toBe("terrain-patch-v2");
+    expect(DEFAULT_GRASS_SETTINGS.shaderMode).toBe("terrain-patch-v2");
+    expect(GRASS_SHADER_MODES).toContain("classic");
+  });
+
   it("is deterministic for the same seed and footprint", () => {
     expect(generateGrassInstances(footprint, settings)).toEqual(generateGrassInstances(footprint, settings));
   });

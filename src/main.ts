@@ -28,6 +28,7 @@ import {
 } from "./material.js";
 import {
   DEFAULT_GRASS_SETTINGS,
+  GRASS_SHADER_MODES,
   GrassSystem,
   type GrassLighting,
   type GrassSettings,
@@ -751,6 +752,7 @@ async function main() {
     audioVolume: getAudioState().masterVolume,
     grassEnabled: false,
     grassShaderMode: DEFAULT_GRASS_SETTINGS.shaderMode,
+    grassAlphaToCoverage: DEFAULT_GRASS_SETTINGS.alphaToCoverage,
     grassDistance: DEFAULT_GRASS_SETTINGS.distance,
     grassBladeSpacing: DEFAULT_GRASS_SETTINGS.bladeSpacing,
     grassBladeHeight: DEFAULT_GRASS_SETTINGS.bladeHeight,
@@ -1058,6 +1060,7 @@ async function main() {
   const makeGrassSettings = (): GrassSettings => ({
     enabled: state.grassEnabled,
     shaderMode: state.grassShaderMode,
+    alphaToCoverage: state.grassAlphaToCoverage,
     distance: state.grassDistance,
     bladeSpacing: state.grassBladeSpacing,
     bladeHeight: state.grassBladeHeight,
@@ -1643,12 +1646,19 @@ async function main() {
   };
   const updateGrassUniforms = () => grassSystem.updateSettings(makeGrassSettings());
   const grassFolder = gui.addFolder("grass shader");
+  const grassShaderOptions = Object.fromEntries(
+    GRASS_SHADER_MODES.map((mode) => [
+      mode === "terrain-patch-v2" ? "terrain patch v2" : "classic",
+      mode,
+    ]),
+  );
   grassFolder.add(state, "grassEnabled").name("enabled").onChange((enabled: boolean) => {
     grassSystem.setEnabled(enabled);
     refreshGrassStats();
     updateInfo();
   });
-  grassFolder.add(state, "grassShaderMode", ["classic", "terrain-patch-v2"]).name("shader").onChange(grassActions.rebuild);
+  grassFolder.add(state, "grassShaderMode", grassShaderOptions).name("shader").onChange(grassActions.rebuild);
+  grassFolder.add(state, "grassAlphaToCoverage").name("alpha to coverage").onChange(updateGrassUniforms);
   grassFolder.add(state, "grassDistance", 16, 512, 1).name("distance").onChange(updateGrassUniforms);
   grassFolder.add(state, "grassBladeSpacing", 0.4, 6, 0.1).name("blade spacing").onFinishChange(grassActions.rebuild);
   grassFolder.add(state, "grassBladeHeight", 0.2, 4, 0.05).name("blade height").onFinishChange(grassActions.rebuild);
@@ -2710,6 +2720,7 @@ async function main() {
     brushFlowMs: state.brushFlowMs,
     grassEnabled: state.grassEnabled,
     grassShaderMode: state.grassShaderMode,
+    grassAlphaToCoverage: state.grassAlphaToCoverage,
     grassDistance: state.grassDistance,
     grassBladeSpacing: state.grassBladeSpacing,
     grassBladeHeight: state.grassBladeHeight,
