@@ -60,7 +60,11 @@ const VERTEX_SHADER = /* glsl */ `
       localPosition.y,
       -s * localPosition.x + c * localPosition.z
     );
-    vec3 localNormal = normalize(vec3(-wind.x * 0.35, bend * 0.16, 1.0 - wind.y * 0.35));
+    vec3 localNormal = normalize(vec3(
+      normal.x - wind.x * 0.35,
+      normal.y + bend * 0.16,
+      normal.z - wind.y * 0.35
+    ));
     vWorldNormal = normalize(vec3(
       c * localNormal.x + s * localNormal.z,
       localNormal.y,
@@ -145,10 +149,11 @@ const TERRAIN_PATCH_VERTEX_SHADER = /* glsl */ `
 
     float edgeHeight = mix(0.35, 1.0, edge);
     float slopeHeight = mix(0.55, 1.0, slope);
+    float widthTaper = mix(1.35, 0.85, uv.y);
     vec3 localPosition = vec3(
-      position.x * uBladeWidth * mix(1.35, 0.85, uv.y),
+      position.x * uBladeWidth * widthTaper,
       position.y * aHeight * edgeHeight * slopeHeight,
-      position.z * uBladeWidth
+      position.z * uBladeWidth * widthTaper
     );
     localPosition.xz += wind;
     localPosition.y -= length(wind) * 0.08 * heightFactor;
@@ -160,7 +165,11 @@ const TERRAIN_PATCH_VERTEX_SHADER = /* glsl */ `
       localPosition.y,
       -s * localPosition.x + c * localPosition.z
     );
-    vec3 localNormal = normalize(vec3(-wind.x * 0.28, 0.18 + uv.y * 0.28, 1.0 - wind.y * 0.24));
+    vec3 localNormal = normalize(vec3(
+      normal.x - wind.x * 0.28,
+      normal.y + 0.18 + uv.y * 0.28,
+      normal.z - wind.y * 0.24
+    ));
     vWorldNormal = normalize(vec3(
       c * localNormal.x + s * localNormal.z,
       localNormal.y,
@@ -233,6 +242,7 @@ export interface GrassSettings {
   enabled: boolean;
   shaderMode: GrassShaderMode;
   alphaToCoverage: boolean;
+  nearCrossedQuads: boolean;
   distance: number;
   bladeSpacing: number;
   bladeHeight: number;
@@ -315,6 +325,7 @@ export const DEFAULT_GRASS_SETTINGS: GrassSettings = {
   enabled: true,
   shaderMode: DEFAULT_GRASS_SHADER_MODE,
   alphaToCoverage: false,
+  nearCrossedQuads: true,
   distance: 96,
   bladeSpacing: 1.6,
   bladeHeight: 1.15,
@@ -462,22 +473,48 @@ export function generateGrassInstances(
   return rankedInstances.slice(0, limit).map(({ instance }) => instance);
 }
 
-function createBladeGeometry(rows: readonly (readonly [number, number])[] = BLADE_ROWS): THREE.BufferGeometry {
+// Each blade is one or more vertical quad strips ("planes"). The base plane spans X and
+// faces +Z; the crossed plane spans Z and faces +X, so a near-facing surface exists at any
+// view angle (fixes edge-on thinning of a single plane). Both planes share the same vertical
+// bend axis, so the vertex shader animates them identically. Per-vertex `normal` lets the
+// shader light/orient each plane correctly instead of assuming a single +Z facing.
+const BLADE_PLANES = {
+  single: [{ axis: "x", normal: [0, 0, 1] }],
+  crossed: [
+    { axis: "x", normal: [0, 0, 1] },
+    { axis: "z", normal: [1, 0, 0] },
+  ],
+} as const;
+
+function createBladeGeometry(
+  rows: readonly (readonly [number, number])[] = BLADE_ROWS,
+  crossed = false,
+): THREE.BufferGeometry {
   const positions: number[] = [];
   const uvs: number[] = [];
+  const normals: number[] = [];
   const indices: number[] = [];
-  for (const [y, halfWidth] of rows) {
-    positions.push(-halfWidth, y, 0, halfWidth, y, 0);
-    uvs.push(0, y, 1, y);
-  }
-  for (let row = 0; row < rows.length - 1; row++) {
-    const lower = row * 2;
-    const upper = lower + 2;
-    indices.push(lower, lower + 1, upper + 1, lower, upper + 1, upper);
+  for (const plane of crossed ? BLADE_PLANES.crossed : BLADE_PLANES.single) {
+    const base = positions.length / 3;
+    for (const [y, halfWidth] of rows) {
+      if (plane.axis === "x") {
+        positions.push(-halfWidth, y, 0, halfWidth, y, 0);
+      } else {
+        positions.push(0, y, -halfWidth, 0, y, halfWidth);
+      }
+      uvs.push(0, y, 1, y);
+      normals.push(...plane.normal, ...plane.normal);
+    }
+    for (let row = 0; row < rows.length - 1; row++) {
+      const lower = base + row * 2;
+      const upper = lower + 2;
+      indices.push(lower, lower + 1, upper + 1, lower, upper + 1, upper);
+    }
   }
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
   geometry.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
+  geometry.setAttribute("normal", new THREE.Float32BufferAttribute(normals, 3));
   geometry.setIndex(indices);
   return geometry;
 }
@@ -523,6 +560,7 @@ export class GrassSystem {
   private readonly root = new THREE.Group();
   private readonly classicBladeGeometry = createBladeGeometry();
   private readonly terrainPatchNearGeometry = createBladeGeometry(V2_NEAR_BLADE_ROWS);
+  private readonly terrainPatchNearCrossedGeometry = createBladeGeometry(V2_NEAR_BLADE_ROWS, true);
   private readonly terrainPatchMidGeometry = createBladeGeometry(V2_MID_BLADE_ROWS);
   private readonly materials = new Map<GrassShaderMode, THREE.ShaderMaterial>();
   private settings: GrassSettings;
@@ -634,6 +672,7 @@ export class GrassSystem {
     this.scene.remove(this.root);
     this.classicBladeGeometry.dispose();
     this.terrainPatchNearGeometry.dispose();
+    this.terrainPatchNearCrossedGeometry.dispose();
     this.terrainPatchMidGeometry.dispose();
     for (const material of this.materials.values()) material.dispose();
   }
@@ -729,8 +768,11 @@ export class GrassSystem {
   }
 
   private createTerrainPatch(nodeId: string, footprint: PageFootprint, instances: GrassBladeInstance[]): GrassPatch {
+    const nearBlade = this.settings.nearCrossedQuads
+      ? this.terrainPatchNearCrossedGeometry
+      : this.terrainPatchNearGeometry;
     const nearGeometry = new THREE.InstancedBufferGeometry();
-    this.populateGeometry(nearGeometry, this.terrainPatchNearGeometry, footprint, instances);
+    this.populateGeometry(nearGeometry, nearBlade, footprint, instances);
 
     const midCount = Math.max(1, Math.floor(instances.length * V2_MID_INSTANCE_FRACTION));
     const midInstances = instances.slice(0, midCount).map((instance) => ({
@@ -767,6 +809,7 @@ export class GrassSystem {
   ): void {
     geometry.setAttribute("position", bladeGeometry.getAttribute("position"));
     geometry.setAttribute("uv", bladeGeometry.getAttribute("uv"));
+    geometry.setAttribute("normal", bladeGeometry.getAttribute("normal"));
     geometry.setIndex(bladeGeometry.getIndex());
 
     const offsets = new Float32Array(instances.length * 3);

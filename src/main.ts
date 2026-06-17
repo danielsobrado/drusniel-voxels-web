@@ -753,6 +753,7 @@ async function main() {
     grassEnabled: false,
     grassShaderMode: DEFAULT_GRASS_SETTINGS.shaderMode,
     grassAlphaToCoverage: DEFAULT_GRASS_SETTINGS.alphaToCoverage,
+    grassNearCrossedQuads: DEFAULT_GRASS_SETTINGS.nearCrossedQuads,
     grassDistance: DEFAULT_GRASS_SETTINGS.distance,
     grassBladeSpacing: DEFAULT_GRASS_SETTINGS.bladeSpacing,
     grassBladeHeight: DEFAULT_GRASS_SETTINGS.bladeHeight,
@@ -1061,6 +1062,7 @@ async function main() {
     enabled: state.grassEnabled,
     shaderMode: state.grassShaderMode,
     alphaToCoverage: state.grassAlphaToCoverage,
+    nearCrossedQuads: state.grassNearCrossedQuads,
     distance: state.grassDistance,
     bladeSpacing: state.grassBladeSpacing,
     bladeHeight: state.grassBladeHeight,
@@ -1659,6 +1661,7 @@ async function main() {
   });
   grassFolder.add(state, "grassShaderMode", grassShaderOptions).name("shader").onChange(grassActions.rebuild);
   grassFolder.add(state, "grassAlphaToCoverage").name("alpha to coverage").onChange(updateGrassUniforms);
+  grassFolder.add(state, "grassNearCrossedQuads").name("near crossed quads").onChange(grassActions.rebuild);
   grassFolder.add(state, "grassDistance", 16, 512, 1).name("distance").onChange(updateGrassUniforms);
   grassFolder.add(state, "grassBladeSpacing", 0.4, 6, 0.1).name("blade spacing").onFinishChange(grassActions.rebuild);
   grassFolder.add(state, "grassBladeHeight", 0.2, 4, 0.05).name("blade height").onFinishChange(grassActions.rebuild);
