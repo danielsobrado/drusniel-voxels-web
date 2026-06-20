@@ -53,10 +53,16 @@ try {
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     }
 
-    Write-Host "Starting CLOD Pages at $Url"
-    $Server = Start-Process -FilePath "npm" -ArgumentList @(
-        "run", "dev", "--", "--host", "127.0.0.1", "--port", "$Port", "--strictPort"
-    ) -WorkingDirectory $RepoRoot -NoNewWindow -PassThru
+    if ($IsWindows) {
+        $Server = Start-Process -FilePath "cmd.exe" -ArgumentList @(
+            "/c", "npm", "run", "dev", "--", "--host", "127.0.0.1", "--port", "$Port", "--strictPort"
+        ) -WorkingDirectory $RepoRoot -NoNewWindow -PassThru
+    } else {
+        Write-Host "Starting CLOD Pages at $Url"
+        $Server = Start-Process -FilePath "npm" -ArgumentList @(
+            "run", "dev", "--", "--host", "127.0.0.1", "--port", "$Port", "--strictPort"
+        ) -WorkingDirectory $RepoRoot -NoNewWindow -PassThru
+    }
 
     try {
         $Deadline = (Get-Date).AddSeconds(30)
