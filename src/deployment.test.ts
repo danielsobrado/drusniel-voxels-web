@@ -31,6 +31,16 @@ describe("GitHub Pages deployment contract", () => {
     expect(packageJson.scripts?.preview).toBe("vite preview");
   });
 
+  it("launches the local dev server at the configured root URL", () => {
+    const localLauncher = readFileSync(resolve(projectRoot, "scripts/startLocal.ps1"), "utf8");
+
+    expect(localLauncher).toContain("$Port = 5180");
+    expect(localLauncher).toContain('$Url = "http://127.0.0.1:$Port/"');
+    expect(localLauncher).toContain('"--port", "$Port", "--strictPort"');
+    expect(localLauncher).not.toContain("drusniel-voxels-bevy/");
+    expect(localLauncher).not.toContain("drusniel-voxels-web/");
+  });
+
   it("deploys the static build through GitHub Pages", () => {
     const workflow = readFileSync(resolve(projectRoot, ".github/workflows/deploy-pages.yml"), "utf8");
     const parsed = load(workflow) as { jobs?: { build?: unknown; deploy?: unknown } };
