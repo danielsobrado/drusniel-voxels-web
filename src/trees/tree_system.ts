@@ -19,6 +19,7 @@ import {
   type TreeInstance,
   type TreeTerrainSampler,
 } from "./tree_instances.js";
+import { createTreeMaterialHandle, type TreeMaterialHandle } from "./tree_material.js";
 
 export interface TreeSystemOptions {
   scene: THREE.Scene;
@@ -51,12 +52,6 @@ interface TreePatch {
   generationStats: TreeGenerationStats;
 }
 
-const LOD_COLORS: Record<TreeLod, number> = {
-  near: 0x2e7d32,
-  mid: 0xd98032,
-  far: 0x3a6ea5,
-};
-
 export class TreeSystem {
   private readonly scene: THREE.Scene;
   private readonly nodes: ClodPageNode[];
@@ -67,18 +62,10 @@ export class TreeSystem {
   private readonly scale = new THREE.Vector3();
   private readonly rotation = new THREE.Quaternion();
   private readonly translation = new THREE.Vector3();
+  private readonly upAxis = new THREE.Vector3(0, 1, 0);
   private settings: TreeSettings;
   private geometries: TreeGeometryMap;
-  private readonly regularMaterial = new THREE.MeshStandardMaterial({
-    vertexColors: true,
-    roughness: 0.95,
-    metalness: 0,
-  });
-  private readonly debugMaterials: Record<TreeLod, THREE.MeshBasicMaterial> = {
-    near: new THREE.MeshBasicMaterial({ color: LOD_COLORS.near }),
-    mid: new THREE.MeshBasicMaterial({ color: LOD_COLORS.mid }),
-    far: new THREE.MeshBasicMaterial({ color: LOD_COLORS.far }),
-  };
+  private readonly materialHandle: TreeMaterialHandle;
   private patches: TreePatch[] = [];
   private patchesDirty = true;
   private readonly lastRefreshCenter = new THREE.Vector3(Number.POSITIVE_INFINITY, 0, 0);
@@ -94,6 +81,7 @@ export class TreeSystem {
     this.settings = { ...options.settings };
     this.sampler = options.sampler;
     this.geometries = createTreeGeometryMap(this.settings);
+    this.materialHandle = createTreeMaterialHandle(this.settings);
     this.lastCenter = new THREE.Vector3(this.worldCells * 0.5, 0, this.worldCells * 0.5);
     this.root.name = "trees";
     this.scene.add(this.root);
@@ -111,18 +99,29 @@ export class TreeSystem {
 
   updateSettings(settings: Partial<TreeSettings>): void {
     const needsGeometry = settings.species !== undefined && settings.species !== this.settings.species;
+    const needsPatchRefresh =
+      needsGeometry ||
+      settings.enabled !== undefined ||
+      settings.seed !== undefined ||
+      settings.distanceM !== undefined ||
+      settings.refreshDistanceM !== undefined ||
+      settings.maxInstances !== undefined ||
+      settings.placement !== undefined ||
+      settings.lod !== undefined;
     Object.assign(this.settings, settings);
     if (needsGeometry) {
       disposeTreeGeometryMap(this.geometries);
       this.geometries = createTreeGeometryMap(this.settings);
       this.clearPatches();
     }
+    this.materialHandle.updateSettings(this.settings);
     this.applyMaterials();
-    this.patchesDirty = true;
+    if (needsPatchRefresh) this.patchesDirty = true;
     this.setEnabled(this.settings.enabled);
   }
 
-  update(_timeSeconds: number, center: THREE.Vector3): void {
+  update(timeSeconds: number, center: THREE.Vector3): void {
+    this.materialHandle.setTime(timeSeconds);
     this.lastCenter.copy(center);
     if (!this.settings.enabled) {
       this.updateStats();
@@ -156,8 +155,7 @@ export class TreeSystem {
     this.clearPatches();
     this.scene.remove(this.root);
     disposeTreeGeometryMap(this.geometries);
-    this.regularMaterial.dispose();
-    for (const material of Object.values(this.debugMaterials)) material.dispose();
+    this.materialHandle.dispose();
   }
 
   getStats(): TreeStats {
@@ -212,6 +210,9 @@ export class TreeSystem {
     );
     const group = new THREE.Group();
     group.name = `tree-patch-${node.id}`;
+    const centerX = footprintCenterX(node.footprint);
+    const centerZ = footprintCenterZ(node.footprint);
+    group.position.set(centerX, 0, centerZ);
     const meshes = {} as Record<TreeSpeciesId, Record<TreeLod, THREE.InstancedMesh>>;
     for (const species of TREE_SPECIES) {
       const speciesCapacity = Math.max(1, instances.filter((instance) => instance.species === species).length);
@@ -225,6 +226,7 @@ export class TreeSystem {
         mesh.name = `trees-${node.id}-${species}-${lod}`;
         mesh.count = 0;
         mesh.frustumCulled = true;
+        mesh.visible = false;
         mesh.castShadow = this.settings.render.shadowsNearOnly && lod === "near";
         mesh.receiveShadow = false;
         meshes[species][lod] = mesh;
@@ -234,8 +236,8 @@ export class TreeSystem {
     return {
       nodeId: node.id,
       footprint: node.footprint,
-      centerX: footprintCenterX(node.footprint),
-      centerZ: footprintCenterZ(node.footprint),
+      centerX,
+      centerZ,
       radius: footprintRadius(node.footprint),
       instances,
       group,
@@ -259,7 +261,12 @@ export class TreeSystem {
           counts.set(patch.meshes[species][lod], 0);
         }
       }
-      if (!patch.visible) continue;
+      if (!patch.visible) {
+        for (const species of TREE_SPECIES) {
+          for (const lod of TREE_LODS) this.updateTreeMeshBounds(patch.meshes[species][lod]);
+        }
+        continue;
+      }
       for (const instance of patch.instances) {
         const distance = distance2d(center.x, center.z, instance.position[0], instance.position[2]);
         if (distance > farDistance) continue;
@@ -267,8 +274,12 @@ export class TreeSystem {
         const mesh = patch.meshes[instance.species][lod];
         const index = counts.get(mesh) ?? 0;
         if (index >= mesh.instanceMatrix.count) continue;
-        this.translation.set(instance.position[0], instance.position[1], instance.position[2]);
-        this.rotation.setFromAxisAngle(new THREE.Vector3(0, 1, 0), instance.rotationY);
+        this.translation.set(
+          instance.position[0] - patch.centerX,
+          instance.position[1],
+          instance.position[2] - patch.centerZ,
+        );
+        this.rotation.setFromAxisAngle(this.upAxis, instance.rotationY);
         this.scale.setScalar(instance.scale);
         this.matrix.compose(this.translation, this.rotation, this.scale);
         mesh.setMatrixAt(index, this.matrix);
@@ -279,14 +290,25 @@ export class TreeSystem {
           const mesh = patch.meshes[species][lod];
           mesh.count = counts.get(mesh) ?? 0;
           mesh.instanceMatrix.needsUpdate = true;
+          this.updateTreeMeshBounds(mesh);
         }
       }
     }
     this.updateStats();
   }
 
+  private updateTreeMeshBounds(mesh: THREE.InstancedMesh): void {
+    if (mesh.count <= 0) {
+      mesh.visible = false;
+      return;
+    }
+    mesh.visible = true;
+    mesh.computeBoundingSphere();
+    mesh.computeBoundingBox();
+  }
+
   private materialFor(lod: TreeLod): THREE.Material {
-    return this.settings.render.debugColorByLod ? this.debugMaterials[lod] : this.regularMaterial;
+    return this.settings.render.debugColorByLod ? this.materialHandle.debugMaterials[lod] : this.materialHandle.regularMaterial;
   }
 
   private applyMaterials(): void {

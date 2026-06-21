@@ -4,9 +4,9 @@ import GUI from "lil-gui";
 import { parseConfig } from "./config.js";
 import configText from "../config/clod_pages.yaml?raw";
 import stoneConfigText from "../config/stones.yaml?raw";
+import treeConfigText from "../config/trees.yaml?raw";
 import proceduralConfigText from "../config/procedural_textures.yaml?raw";
 import grassConfigText from "../config/grass.yaml?raw";
-import treeConfigText from "../config/trees.yaml?raw";
 import { ClodWorkerClient } from "./clod_worker_client.js";
 import { emitAudio, setAudioEnabled, setMasterVolume, getAudioState } from "./audio/index.js";
 import {
@@ -52,7 +52,7 @@ import {
 import { parseStoneConfig, STONE_CLASSES, type StoneClass } from "./stones/stone_config.js";
 import { StoneSystem, type StoneLighting, type StoneStats } from "./stones/stone_instances.js";
 import { assertPageMeshSignaturesUnchanged, pageMeshSignatures } from "./stones/stone_validation.js";
-import { parseTreeConfig, TreeSystem, type TreeSettings, type TreeStats } from "./trees/index.js";
+import { formatTreeInfoLine, parseTreeConfig, TreeSystem, type TreeStats } from "./trees/index.js";
 import {
   DEFAULT_PLAYER_CONFIG,
   PlayerController,
@@ -445,7 +445,7 @@ function appendCrossLodBorderSegments(pts: number[], adjacency: CrossLodAdjacenc
 
 async function main() {
   const info = document.getElementById("info")!;
-  
+
   // Load and validate Content Registry
   try {
     const searchParamsTemp = new URLSearchParams(location.search);
@@ -516,6 +516,7 @@ async function main() {
   const searchParams = new URLSearchParams(location.search);
   const queryScene = searchParams.get("scene");
   const queryGrassPerfScene = queryScene === "grass-perf";
+  const queryTreePerfScene = queryScene === "trees-perf" || searchParams.get("treesPerf") === "1";
   const queryPerfMode = searchParams.get("clodPerf") === "1";
   const queryWebGpuSelection = searchParams.get("webgpuSelection") === "1";
   // CPU/GPU error_px parity is a full per-node sweep; opt-in keeps it from hitching the
@@ -562,8 +563,8 @@ async function main() {
   }
   const cfg = stagedImport?.manifest.config ?? parseConfig(configText);
   const stoneConfig = parseStoneConfig(stoneConfigText);
-  const grassConfig = parseGrassConfig(grassConfigText);
   const treeConfig = parseTreeConfig(treeConfigText);
+  const grassConfig = parseGrassConfig(grassConfigText);
   const proceduralTextureConfig = parseProceduralTextureConfig(proceduralConfigText);
   const proceduralTerrain = proceduralTextureConfig.enabled
     ? createProceduralTerrainTextures(proceduralTextureConfig)
@@ -577,7 +578,7 @@ async function main() {
   // World size via ?world=. 8x8 gives full LOD0..LOD3 depth for A3 / delta-2-3
   // inspection; 16/32 keep the same max LOD with more roots and can freeze the tab longer.
   const requested = Number(searchParams.get("world"));
-  const WORLD = stagedImport?.manifest.worldSize ?? (WORLD_OPTIONS.includes(requested) ? requested : queryGrassPerfScene ? 16 : 4);
+  const WORLD = stagedImport?.manifest.worldSize ?? (WORLD_OPTIONS.includes(requested) ? requested : queryGrassPerfScene || queryTreePerfScene ? 16 : 4);
   let buildStatus = "preparing";
   const updateBuildOverlay = () => updateClodOverlay({
     worldSize: WORLD,
@@ -733,6 +734,11 @@ async function main() {
   } else if (queryGrassPerfScene) {
     controls.target.set(mid, 20, mid);
     camera.position.set(mid - worldCells * 0.24, 46, mid + worldCells * 0.34);
+    camera.lookAt(controls.target);
+    controls.update();
+  } else if (queryTreePerfScene) {
+    controls.target.set(mid, 24, mid);
+    camera.position.set(mid - worldCells * 0.28, 58, mid + worldCells * 0.38);
     camera.lookAt(controls.target);
     controls.update();
   }
@@ -1028,7 +1034,7 @@ async function main() {
     frontSideOnly: false,
     recomputedNormals: false,
     forceMaxLevel: "auto",
-    terrainMaterialSource: (queryPerfMode || !proceduralTerrain ? "external_pbr" : "procedural") as TerrainMaterialSource,
+    terrainMaterialSource: "external_pbr" as TerrainMaterialSource,
     proceduralDebugMode: "final" as ProceduralDebugMode,
     proceduralMicroNormals: true,
     textureScale: 1,
@@ -1100,13 +1106,6 @@ async function main() {
     grassCandidateCount: 0,
     grassPatchRebuildCount: 0,
     grassBuildMs: 0,
-    treesEnabled: treeConfig.enabled,
-    treeDistance: treeConfig.distanceM,
-    treeMaxInstances: treeConfig.maxInstances,
-    treeDebugColorByLod: treeConfig.render.debugColorByLod,
-    treeTotal: 0,
-    treeVisiblePatches: "0/0",
-    treeLodSummary: "0/0/0",
     stonesEnabled: stoneConfig.enabled,
     stoneDensity: stoneConfig.density,
     stoneMaxInstances: stoneConfig.maxInstances,
@@ -1117,6 +1116,19 @@ async function main() {
     stoneTotal: 0,
     stoneClassSummary: "0/0/0",
     stoneVisible: 0,
+    treesEnabled: treeConfig.enabled,
+    treeDistance: treeConfig.distanceM,
+    treeMaxInstances: treeConfig.maxInstances,
+    treeDebugColorByLod: treeConfig.render.debugColorByLod,
+    treeWindEnabled: treeConfig.wind.enabled,
+    treeWindStrength: treeConfig.wind.strength,
+    treeWindSpeed: treeConfig.wind.speed,
+    treeGustStrength: treeConfig.wind.gustStrength,
+    treeTrunkSwayStrength: treeConfig.wind.trunkSwayStrength,
+    treeLeafFlutterStrength: treeConfig.wind.leafFlutterStrength,
+    treeTotal: 0,
+    treeVisiblePatches: "0/0",
+    treeLodSummary: "0/0/0",
   };
   if (stagedImport) Object.assign(state, stagedImport.manifest.state);
   if (isWebGpu) state.normalDivergence = false;
@@ -1139,6 +1151,7 @@ async function main() {
     state.showLockedBorderVertices = false;
     state.grassEnabled = false;
     state.stonesEnabled = false;
+    state.treesEnabled = false;
   }
   if (queryGrassPerfScene) {
     state.grassEnabled = true;
@@ -1155,8 +1168,22 @@ async function main() {
     state.showNodeLabels = false;
     state.showLockedBorderVertices = false;
   }
+  if (queryTreePerfScene) {
+    state.grassEnabled = false;
+    state.stonesEnabled = false;
+    state.treesEnabled = true;
+    state.postProcessEnabled = false;
+    state.postProcessDebugMode = "off";
+    state.showBounds = false;
+    state.showSeamPoints = false;
+    state.showCrossLodBorders = false;
+    state.showNodeLabels = false;
+    state.showLockedBorderVertices = false;
+  }
   if (searchParams.get("stones") === "1") state.stonesEnabled = true;
   if (searchParams.get("stones") === "0") state.stonesEnabled = false;
+  if (searchParams.get("trees") === "1") state.treesEnabled = true;
+  if (searchParams.get("trees") === "0") state.treesEnabled = false;
   let colorByLodUserOverride = stagedImport !== null;
   let lastTexturesActive: boolean | null = null;
   let colorByLodController: { updateDisplay: () => unknown } | null = null;
@@ -1369,7 +1396,9 @@ async function main() {
         enabled: false,
         noiseA: null,
         noiseB: null,
-        debugMode: 0,
+        // Carry the debug-view selection even for external_pbr so the "procedural debug" dropdown
+        // works on the non-procedural source too (paint weights / albedo layer views).
+        debugMode: PROCEDURAL_DEBUG_MODES[state.proceduralDebugMode],
         microFadeStart: 45,
         microFadeEnd: 85,
         lodBias: 0,
@@ -1630,16 +1659,6 @@ async function main() {
     ring: { ...grassConfig.ring },
     patchFallback: { ...grassConfig.patchFallback },
   });
-  const makeTreeSettings = (): TreeSettings => ({
-    ...treeConfig,
-    enabled: state.treesEnabled,
-    distanceM: state.treeDistance,
-    maxInstances: state.treeMaxInstances,
-    render: {
-      ...treeConfig.render,
-      debugColorByLod: state.treeDebugColorByLod,
-    },
-  });
   const currentGrassLighting = (): GrassLighting => {
     const lighting = currentLighting();
     return {
@@ -1657,8 +1676,6 @@ async function main() {
   });
   let grass: GrassSystem | null = null;
   let grassStats: GrassStats | null = null;
-  let treeSystem: TreeSystem | null = null;
-  let treeStats: TreeStats | null = null;
   let stones: StoneSystem | null = null;
   let selState: SelectionState = { split: new Set() };
   const pageTransitionMode = cfg.selection.transition_mode;
@@ -1729,20 +1746,6 @@ async function main() {
   state.grassBladeCount = grassSystem.getBladeCount();
   grassStats = grassSystem.getStats();
 
-  const treePageNodes = allNodes.filter((node) => node.level === 0);
-  const treePageSignaturesBefore = pageMeshSignatures(treePageNodes);
-  treeSystem = new TreeSystem({
-    scene,
-    nodes: treePageNodes,
-    worldCells,
-    settings: makeTreeSettings(),
-  });
-  assertPageMeshSignaturesUnchanged(treePageSignaturesBefore, pageMeshSignatures(treePageNodes));
-  treeStats = treeSystem.getStats();
-  state.treeTotal = treeStats.totalTrees;
-  state.treeVisiblePatches = `${treeStats.visiblePatches}/${treeStats.patches}`;
-  state.treeLodSummary = `${treeStats.nearTrees}/${treeStats.midTrees}/${treeStats.farTrees}`;
-
   // Stone overlay (ground-detail props). Pure visual layer: scattered over the LOD0 page
   // footprints and added to the scene, never fed into the page source mesh / weld path.
   const makeStoneSettings = () => ({
@@ -1779,6 +1782,36 @@ async function main() {
   stoneSystem.setVisibleClasses(visibleStoneClasses());
   stones = stoneSystem;
   let stoneStats: StoneStats | null = stoneSystem.getStats();
+
+  const makeTreeSettings = () => ({
+    ...treeConfig,
+    enabled: state.treesEnabled,
+    distanceM: state.treeDistance,
+    maxInstances: state.treeMaxInstances,
+    wind: {
+      ...treeConfig.wind,
+      enabled: state.treeWindEnabled,
+      strength: state.treeWindStrength,
+      speed: state.treeWindSpeed,
+      gustStrength: state.treeGustStrength,
+      trunkSwayStrength: state.treeTrunkSwayStrength,
+      leafFlutterStrength: state.treeLeafFlutterStrength,
+    },
+    render: {
+      ...treeConfig.render,
+      debugColorByLod: state.treeDebugColorByLod,
+    },
+  });
+  const treePageNodes = allNodes.filter((node) => node.level === 0);
+  const treePageSignaturesBefore = pageMeshSignatures(treePageNodes);
+  const treeSystem = new TreeSystem({
+    scene,
+    nodes: treePageNodes,
+    worldCells,
+    settings: makeTreeSettings(),
+  });
+  assertPageMeshSignaturesUnchanged(treePageSignaturesBefore, pageMeshSignatures(treePageNodes));
+  let treeStats: TreeStats | null = treeSystem.getStats();
 
   const rebuildDebugOverlays = (rendered: ClodPageNode[], xLodAdjacencies: CrossLodAdjacency[]) => {
     boundaryGroup.clear();
@@ -1908,8 +1941,9 @@ async function main() {
     const playerLine = interaction.mode === "playing"
       ? `player: grounded=${player.grounded}  physics p95=${player.physicsP95Ms().toFixed(2)} ms  collider pages=${player.lastPagesTested}`
       : `view: ${interaction.mode}`;
+    const sceneLabel = queryGrassPerfScene ? "  GRASS PERF" : queryTreePerfScene ? "  TREE PERF" : "";
     info.textContent =
-      `Drusniel Voxels Web — ${WORLD}x${WORLD} pages${queryGrassPerfScene ? "  GRASS PERF" : ""}\n` +
+      `Drusniel Voxels Web — ${WORLD}x${WORLD} pages${sceneLabel}\n` +
       `cut: ${lastRenderedCount} nodes  (${lastLevelSummary})\n` +
       `tris rendered: ${lastTriCount.toLocaleString()}   2:1 forced splits: ${lastForced}   ` +
       `bubble forced splits: ${lastNearFieldForced}   xLOD borders: ${lastCrossLodAdjacencyCount}\n` +
@@ -1929,9 +1963,7 @@ async function main() {
           ` gpu-n/m/f/s=${grassStats.gpuRingVisibleNear}/${grassStats.gpuRingVisibleMid}/${grassStats.gpuRingVisibleFar}/${grassStats.gpuRingVisibleSuper}` +
           ` gpu-dispatch=${grassStats.gpuRingDispatchMs === null ? "-" : grassStats.gpuRingDispatchMs.toFixed(2)}ms`
         : grassStats ? ` gpu-grass=${grassStats.gpuRingStatus}` : ""}\n` +
-      `trees: ${state.treesEnabled ? "enabled" : "disabled"} ${state.treeTotal.toLocaleString()} trees ` +
-      `${treeStats ? `patches=${treeStats.visiblePatches}/${treeStats.patches} ` +
-      `lod n/m/f=${treeStats.nearTrees}/${treeStats.midTrees}/${treeStats.farTrees}` : ""}\n` +
+      `${formatTreeInfoLine(state.treesEnabled, state.treeTotal, treeStats)}\n` +
       `brush: ${state.digEnabled ? "on" : "off"}  ${state.brushOp === "add" ? "raise" : "dig"} ${state.brushShape} r=${state.digRadius}  edits=${digEditCount()}\n` +
       `${lastDigSummary ? `last: ${lastDigSummary}\n` : ""}` +
       `${lastArchiveSummary ? `${lastArchiveSummary}\n` : ""}` +
@@ -2212,7 +2244,6 @@ async function main() {
       }
       if (state.treesEnabled && lod0.changed.length > 0) {
         treeSystem?.rebuildNodePatches(lod0.changed.map((node) => node.id));
-        refreshTreeStats();
       }
       pendingParentNodes = 0;
       pendingParentMs = 0;
@@ -2544,41 +2575,6 @@ async function main() {
   grassBuildMsController = grassFolder.add(state, "grassBuildMs").name("build ms").disable();
   grassFolder.add(grassActions, "rebuild").name("rebuild");
 
-  let treeTotalController: { updateDisplay: () => unknown } | null = null;
-  let treeVisiblePatchesController: { updateDisplay: () => unknown } | null = null;
-  let treeLodSummaryController: { updateDisplay: () => unknown } | null = null;
-  const refreshTreeStats = () => {
-    if (!treeSystem) return;
-    treeStats = treeSystem.getStats();
-    state.treeTotal = treeStats.totalTrees;
-    state.treeVisiblePatches = `${treeStats.visiblePatches}/${treeStats.patches}`;
-    state.treeLodSummary = `${treeStats.nearTrees}/${treeStats.midTrees}/${treeStats.farTrees}`;
-    treeTotalController?.updateDisplay();
-    treeVisiblePatchesController?.updateDisplay();
-    treeLodSummaryController?.updateDisplay();
-  };
-  const treeActions = {
-    rebuild: () => {
-      treeSystem?.updateSettings(makeTreeSettings());
-      treeSystem?.rebuild();
-      refreshTreeStats();
-      updateInfo();
-    },
-  };
-  const treeFolder = gui.addFolder("trees (props)");
-  treeFolder.add(state, "treesEnabled").name("enabled").onChange((enabled: boolean) => {
-    treeSystem?.setEnabled(enabled);
-    refreshTreeStats();
-    updateInfo();
-  });
-  treeFolder.add(state, "treeDistance", 32, 512, 1).name("distance").onChange(treeActions.rebuild);
-  treeFolder.add(state, "treeMaxInstances", 0, 20000, 100).name("max instances").onFinishChange(treeActions.rebuild);
-  treeFolder.add(state, "treeDebugColorByLod").name("debug color by LOD").onChange(treeActions.rebuild);
-  treeTotalController = treeFolder.add(state, "treeTotal").name("tree count").disable();
-  treeVisiblePatchesController = treeFolder.add(state, "treeVisiblePatches").name("visible patches").disable();
-  treeLodSummaryController = treeFolder.add(state, "treeLodSummary").name("near/mid/far").disable();
-  treeFolder.add(treeActions, "rebuild").name("rebuild");
-
   let stoneTotalController: { updateDisplay: () => unknown } | null = null;
   let stoneClassSummaryController: { updateDisplay: () => unknown } | null = null;
   let stoneVisibleController: { updateDisplay: () => unknown } | null = null;
@@ -2620,6 +2616,64 @@ async function main() {
   stoneClassSummaryController = stoneFolder.add(state, "stoneClassSummary").name("L/M/S").disable();
   stoneVisibleController = stoneFolder.add(state, "stoneVisible").name("visible").disable();
   stoneFolder.add(stoneActions, "rebuild").name("rebuild");
+
+  let treeTotalController: { updateDisplay: () => unknown } | null = null;
+  let treeVisiblePatchesController: { updateDisplay: () => unknown } | null = null;
+  let treeLodSummaryController: { updateDisplay: () => unknown } | null = null;
+  const refreshTreeStats = () => {
+    if (!treeSystem) return;
+    treeStats = treeSystem.getStats();
+    state.treeTotal = treeStats.totalTrees;
+    state.treeVisiblePatches = `${treeStats.visiblePatches}/${treeStats.patches}`;
+    state.treeLodSummary = `${treeStats.nearTrees}/${treeStats.midTrees}/${treeStats.farTrees}`;
+    treeTotalController?.updateDisplay();
+    treeVisiblePatchesController?.updateDisplay();
+    treeLodSummaryController?.updateDisplay();
+  };
+  const updateTreeWindSettings = () => treeSystem?.updateSettings({
+    wind: {
+      ...treeConfig.wind,
+      enabled: state.treeWindEnabled,
+      strength: state.treeWindStrength,
+      speed: state.treeWindSpeed,
+      gustStrength: state.treeGustStrength,
+      trunkSwayStrength: state.treeTrunkSwayStrength,
+      leafFlutterStrength: state.treeLeafFlutterStrength,
+    },
+  });
+  const updateTreeRenderSettings = () => treeSystem?.updateSettings({
+    render: {
+      ...treeConfig.render,
+      debugColorByLod: state.treeDebugColorByLod,
+    },
+  });
+  const treeActions = {
+    rebuild: () => {
+      treeSystem?.updateSettings(makeTreeSettings());
+      treeSystem?.rebuild();
+      refreshTreeStats();
+      updateInfo();
+    },
+  };
+  const treeFolder = gui.addFolder("trees (props)");
+  treeFolder.add(state, "treesEnabled").name("enabled").onChange((enabled: boolean) => {
+    treeSystem?.setEnabled(enabled);
+    refreshTreeStats();
+    updateInfo();
+  });
+  treeFolder.add(state, "treeDistance", 0, 600, 5).name("distance").onFinishChange(treeActions.rebuild);
+  treeFolder.add(state, "treeMaxInstances", 0, 20000, 100).name("max instances").onFinishChange(treeActions.rebuild);
+  treeFolder.add(state, "treeDebugColorByLod").name("debug color by LOD").onChange(updateTreeRenderSettings);
+  treeFolder.add(state, "treeWindEnabled").name("wind enabled").onChange(updateTreeWindSettings);
+  treeFolder.add(state, "treeWindStrength", 0, 1, 0.01).name("wind strength").onChange(updateTreeWindSettings);
+  treeFolder.add(state, "treeWindSpeed", 0, 4, 0.05).name("wind speed").onChange(updateTreeWindSettings);
+  treeFolder.add(state, "treeGustStrength", 0, 1, 0.01).name("gust strength").onChange(updateTreeWindSettings);
+  treeFolder.add(state, "treeTrunkSwayStrength", 0, 1, 0.01).name("trunk sway").onChange(updateTreeWindSettings);
+  treeFolder.add(state, "treeLeafFlutterStrength", 0, 1, 0.01).name("leaf flutter").onChange(updateTreeWindSettings);
+  treeTotalController = treeFolder.add(state, "treeTotal").name("total").disable();
+  treeVisiblePatchesController = treeFolder.add(state, "treeVisiblePatches").name("visible patches").disable();
+  treeLodSummaryController = treeFolder.add(state, "treeLodSummary").name("near/mid/far").disable();
+  treeFolder.add(treeActions, "rebuild").name("rebuild");
 
   const textureInput = document.createElement("input");
   textureInput.type = "file";
@@ -3696,6 +3750,12 @@ async function main() {
     treeDistance: state.treeDistance,
     treeMaxInstances: state.treeMaxInstances,
     treeDebugColorByLod: state.treeDebugColorByLod,
+    treeWindEnabled: state.treeWindEnabled,
+    treeWindStrength: state.treeWindStrength,
+    treeWindSpeed: state.treeWindSpeed,
+    treeGustStrength: state.treeGustStrength,
+    treeTrunkSwayStrength: state.treeTrunkSwayStrength,
+    treeLeafFlutterStrength: state.treeLeafFlutterStrength,
   });
 
   const projectTextureMetadata = (): ProjectTextureSlot[] => textureSlots.map((slot, index) => {
@@ -3886,7 +3946,6 @@ async function main() {
   refreshGrassStats();
   treeSystem?.setEnabled(state.treesEnabled);
   treeSystem?.updateSettings(makeTreeSettings());
-  treeSystem?.rebuild();
   refreshTreeStats();
   updateSelection();
   updateInfo();
@@ -4064,6 +4123,25 @@ async function main() {
     grassSystem?.update(elapsedSeconds, grassCenter, camera);
     treeSystem?.update(elapsedSeconds, grassCenter);
     stoneSystem?.update(grassCenter);
+    const nextTreeStats = treeSystem?.getStats();
+    if (
+      nextTreeStats && (
+      !treeStats ||
+      nextTreeStats.totalTrees !== treeStats.totalTrees ||
+      nextTreeStats.visiblePatches !== treeStats.visiblePatches ||
+      nextTreeStats.patches !== treeStats.patches ||
+      nextTreeStats.nearTrees !== treeStats.nearTrees ||
+      nextTreeStats.midTrees !== treeStats.midTrees ||
+      nextTreeStats.farTrees !== treeStats.farTrees)
+    ) {
+      treeStats = nextTreeStats;
+      state.treeTotal = nextTreeStats.totalTrees;
+      state.treeVisiblePatches = `${nextTreeStats.visiblePatches}/${nextTreeStats.patches}`;
+      state.treeLodSummary = `${nextTreeStats.nearTrees}/${nextTreeStats.midTrees}/${nextTreeStats.farTrees}`;
+      treeTotalController?.updateDisplay();
+      treeVisiblePatchesController?.updateDisplay();
+      treeLodSummaryController?.updateDisplay();
+    }
     const nextStoneStats = stoneSystem?.getStats();
     if (nextStoneStats && (!stoneStats || nextStoneStats.total !== stoneStats.total || nextStoneStats.visible !== stoneStats.visible)) {
       stoneStats = nextStoneStats;
@@ -4106,25 +4184,6 @@ async function main() {
       grassCandidateCountController?.updateDisplay();
     }
     const currentGrassStats = nextGrassStats ?? grassStats;
-    const nextTreeStats = treeSystem?.getStats();
-    if (
-      nextTreeStats && (
-      !treeStats ||
-      nextTreeStats.totalTrees !== treeStats.totalTrees ||
-      nextTreeStats.visiblePatches !== treeStats.visiblePatches ||
-      nextTreeStats.patches !== treeStats.patches ||
-      nextTreeStats.nearTrees !== treeStats.nearTrees ||
-      nextTreeStats.midTrees !== treeStats.midTrees ||
-      nextTreeStats.farTrees !== treeStats.farTrees)
-    ) {
-      treeStats = nextTreeStats;
-      state.treeTotal = nextTreeStats.totalTrees;
-      state.treeVisiblePatches = `${nextTreeStats.visiblePatches}/${nextTreeStats.patches}`;
-      state.treeLodSummary = `${nextTreeStats.nearTrees}/${nextTreeStats.midTrees}/${nextTreeStats.farTrees}`;
-      treeTotalController?.updateDisplay();
-      treeVisiblePatchesController?.updateDisplay();
-      treeLodSummaryController?.updateDisplay();
-    }
     nodeLabelOverlay.update({
       nodes: lastRenderedNodes,
       camera,
@@ -4154,7 +4213,7 @@ async function main() {
             ` | selection ${lastSelectionMs.toFixed(1)}` +
             ` (cut ${selSub.cut.toFixed(1)} book ${selSub.book.toFixed(1)} info ${selSub.info.toFixed(1)} overlays ${selSub.overlays.toFixed(1)})` +
             ` bubble/chunks ${bubbleMs.toFixed(1)} (built ${chunkGroupsBuiltThisFrame})` +
-            ` grass+stones ${propsMs.toFixed(1)}` +
+            ` props ${propsMs.toFixed(1)}` +
             ` render ${renderMs.toFixed(1)}` +
             ` other ${otherMs.toFixed(1)}` +
             ` | cut=${lastRenderedCount} chunkGroups=${chunkGroups.size} mode=${interaction.mode}`,
