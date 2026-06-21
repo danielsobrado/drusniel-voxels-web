@@ -10,6 +10,7 @@ $PackageJson = Join-Path $RepoRoot "package.json"
 $NodeModules = Join-Path $RepoRoot "node_modules"
 $BasePath = "/drusniel-voxels-web/"
 $Port = 5173
+$IsWindowsHost = [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT
 
 if (-not (Test-Path -LiteralPath $PackageJson -PathType Leaf)) {
     throw "Could not find package.json from $RepoRoot"
@@ -53,9 +54,10 @@ try {
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     }
 
-    if ($IsWindows) {
-        $Server = Start-Process -FilePath "cmd.exe" -ArgumentList @(
-            "/c", "npm", "run", "dev", "--", "--host", "127.0.0.1", "--port", "$Port", "--strictPort"
+    if ($IsWindowsHost) {
+        Write-Host "Starting CLOD Pages at $Url"
+        $Server = Start-Process -FilePath "npm.cmd" -ArgumentList @(
+            "run", "dev", "--", "--host", "127.0.0.1", "--port", "$Port", "--strictPort"
         ) -WorkingDirectory $RepoRoot -NoNewWindow -PassThru
     } else {
         Write-Host "Starting CLOD Pages at $Url"
