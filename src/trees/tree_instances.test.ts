@@ -14,6 +14,7 @@ import {
   createTreeRingNodeMaterialHandle,
   disposeTreeGeometryMap,
   formatTreeInfoLine,
+  formatTreeTotalDisplay,
   generateTreeInstances,
   generateTreeRingLightingProxies,
   injectTreeFoliageFragmentShader,
@@ -120,6 +121,7 @@ function fakeRingStats() {
     acceptedCandidates: 3,
     counts: { near: 1, mid: 1, far: 1, impostor: 0 },
     groupCounts: [],
+    overflowed: false,
     dispatchMs: 0.25,
     readbackMs: null,
     skippedDispatches: 0,
@@ -1468,6 +1470,7 @@ describe("TreeSystem", () => {
         acceptedCandidates: 37,
         counts: { near: 5, mid: 11, far: 13, impostor: 8 },
         groupCounts: [],
+        overflowed: false,
         dispatchMs: 1.25,
         readbackMs: 0.5,
         skippedDispatches: 0,
@@ -1543,6 +1546,32 @@ describe("TreeSystem", () => {
       rejectedHeight: 0,
       rejectedMaterial: 0,
     })).toBe("trees: enabled 1,234 trees patches=4/9 lod n/m/f/i=11/22/33/0 gpu=ring candidates=44 accepted=40 visible=37");
+    const hiddenGpuStats = {
+      totalTrees: 0,
+      patches: 0,
+      visiblePatches: 0,
+      culledPatches: 0,
+      nearTrees: 0,
+      midTrees: 0,
+      farTrees: 0,
+      impostorTrees: 0,
+      gpuStatus: "ring" as const,
+      gpuCandidateCount: 0,
+      gpuAcceptedCount: 0,
+      gpuVisibleCount: 0,
+      gpuOverflowed: false,
+      gpuDispatchMs: null,
+      gpuShowCounts: false,
+      impostorStatus: "disabled" as const,
+      impostorReason: null,
+      generatedCandidates: 0,
+      acceptedCandidates: 0,
+      rejectedSlope: 0,
+      rejectedHeight: 0,
+      rejectedMaterial: 0,
+    };
+    expect(formatTreeTotalDisplay(hiddenGpuStats)).toBe("counts off");
+    expect(formatTreeInfoLine(true, formatTreeTotalDisplay(hiddenGpuStats), hiddenGpuStats)).toBe("trees: enabled gpu=ring counts=off");
     expect(formatTreeInfoLine(false, 0, null)).toBe("trees: disabled 0 trees");
   });
 });

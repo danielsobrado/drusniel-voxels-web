@@ -14,6 +14,7 @@ import { ClodWorkerClient } from "./clod_worker_client.js";
 import { emitAudio, setAudioEnabled, setMasterVolume, getAudioState } from "./audio/index.js";
 import {
   addDigEdit,
+  baseSurfaceHeight,
   type BrushOp,
   type BrushShape,
   digEditCount,
@@ -23,6 +24,7 @@ import {
   PAINT_BLEND_CHANNELS,
   paintWeightsAt,
   replaceDigEdits,
+  setTerrainSurfaceOverride,
   surfaceHeight,
 } from "./terrain.js";
 import { GpuChunkMesher } from "./gpu/gpu_chunk_mesher.js";
@@ -55,7 +57,7 @@ import {
 import { parseStoneConfig, STONE_CLASSES, type StoneClass } from "./stones/stone_config.js";
 import { StoneSystem, type StoneLighting, type StoneStats } from "./stones/stone_instances.js";
 import { assertPageMeshSignaturesUnchanged, pageMeshSignatures } from "./stones/stone_validation.js";
-import { formatTreeInfoLine, parseTreeConfig, TreeSystem, type TreeStats } from "./trees/index.js";
+import { formatTreeInfoLine, formatTreeTotalDisplay, parseTreeConfig, TreeSystem, type TreeStats } from "./trees/index.js";
 import {
   formatUnderstoryInfoLine,
   parseUnderstoryConfig,
@@ -113,6 +115,8 @@ import {
   type WaterDebugState,
   WATER_DEBUG_MODES,
   resolveWaterConfig,
+  HydrologySystem,
+  makeFakeBodyCarvedSampler,
 } from "./water/index.js";
 import { createWaterShaderMaterial } from "./water/waterMaterial.js";
 import { createSkyNodeMaterial, type SkyNodeHandle } from "./gpu/sky_node_material.js";
@@ -476,6 +480,23 @@ function appendCrossLodBorderSegments(pts: number[], adjacency: CrossLodAdjacenc
 
 async function main() {
   const info = document.getElementById("info")!;
+  const earlySearchParams = new URLSearchParams(location.search);
+  const earlyScene = earlySearchParams.get("scene");
+  if (
+    (earlyScene === "sanity" || earlyScene === "phase1-terrain") &&
+    earlySearchParams.get("webgpuSpike") !== "1" &&
+    earlySearchParams.get("webgpu") !== "1" &&
+    earlySearchParams.get("grassFirstInstanceSmoke") !== "1"
+  ) {
+    if (earlyScene === "phase1-terrain") {
+      const { runPhase1TerrainScene } = await import("./phase1/phase1_scene.js");
+      await runPhase1TerrainScene();
+    } else {
+      const { runPhase0SanityScene } = await import("./debug/sanity_scene.js");
+      await runPhase0SanityScene();
+    }
+    return;
+  }
 
   // Load and validate Content Registry
   try {
@@ -548,7 +569,7 @@ async function main() {
   const queryScene = searchParams.get("scene");
   const queryGrassPerfScene = queryScene === "grass-perf";
   const queryTreePerfScene = queryScene === "trees-perf" || searchParams.get("treesPerf") === "1";
-  const queryTreeGpuRing = searchParams.get("treeGpu") === "1";
+  const queryTreeGpuRing = searchParams.get("treeGpu") === "1" || searchParams.get("treeGpuRing") === "1";
   const queryForestFloorScene = queryScene === "forest-floor";
   const queryPerfMode = searchParams.get("clodPerf") === "1";
   const queryWebGpuSelection = searchParams.get("webgpuSelection") === "1";
@@ -616,6 +637,8 @@ async function main() {
   // inspection; 16/32 keep the same max LOD with more roots and can freeze the tab longer.
   const requested = Number(searchParams.get("world"));
   const WORLD = stagedImport?.manifest.worldSize ?? (WORLD_OPTIONS.includes(requested) ? requested : queryGrassPerfScene || queryTreePerfScene || queryForestFloorScene ? 16 : 4);
+  const worldCells = WORLD * cfg.page.chunks_per_page * cfg.page.chunk_size;
+  waterConfig = resolveWaterConfig(waterConfig, worldCells);
   let buildStatus = "preparing";
   const updateBuildOverlay = () => updateClodOverlay({
     worldSize: WORLD,
@@ -629,6 +652,25 @@ async function main() {
   });
   updateBuildOverlay();
   if (stagedImport) replaceDigEdits(stagedImport.manifest.terrainEdits);
+  const preHydrologyTerrain = makeFakeBodyCarvedSampler(waterConfig, { surfaceHeight: baseSurfaceHeight });
+  const hydrologySystem = waterConfig.enabled && waterConfig.source === "hydrology" && waterConfig.hydrology.enabled
+    ? HydrologySystem.build(waterConfig.hydrology, worldCells, preHydrologyTerrain)
+    : null;
+  if (hydrologySystem) {
+    setTerrainSurfaceOverride((x, z) => hydrologySystem.terrainHeight(x, z));
+    console.log("[water] hydrology built", hydrologySystem.stats);
+  } else if (waterConfig.enabled && waterConfig.fakeBodies.carveTerrain) {
+    setTerrainSurfaceOverride((x, z) => preHydrologyTerrain.surfaceHeight(x, z));
+  } else {
+    setTerrainSurfaceOverride(null);
+  }
+  const hydrologyTerrain = hydrologySystem
+    ? {
+        res: hydrologySystem.grid.res,
+        worldCells: hydrologySystem.grid.worldCells,
+        carvedBed: hydrologySystem.grid.carvedBed,
+      }
+    : null;
   const buildNote =
     WORLD >= 16 ? " (worker build; large world may take a while)" :
     WORLD >= 8 ? " (worker build)" :
@@ -649,7 +691,7 @@ async function main() {
     info.textContent = `building ${WORLD}x${WORLD} world… ${Math.floor(fraction * 100)}%\n${phase}  L${level}  ${done}/${total}`;
     buildStatus = `${phase} L${level} ${done}/${total}`;
     updateBuildOverlay();
-  });
+  }, hydrologyTerrain);
   buildProgress.hidden = true;
   buildStatus = "ready";
   const polishLine = formatDiagonalPolishStats(aggregateDiagonalPolishStats(result.stats.map((s) => s.polish)));
@@ -757,8 +799,6 @@ async function main() {
   document.body.appendChild(renderer.domElement);
 
   const scene = new THREE.Scene();
-  const worldCells = WORLD * cfg.page.chunks_per_page * cfg.page.chunk_size;
-  waterConfig = resolveWaterConfig(waterConfig, worldCells);
   let anyBodyInWorld = false;
   for (const lake of waterConfig.fakeBodies.lakes) {
     if (lake.center[0] >= 0 && lake.center[0] <= worldCells && lake.center[1] >= 0 && lake.center[1] <= worldCells) {
@@ -1215,7 +1255,7 @@ async function main() {
     treeGpuEnabled: treeConfig.gpu.enabled,
     treeGpuForceCpu: treeConfig.gpu.debugForceCpu,
     treeGpuShowCounts: treeConfig.gpu.debugShowGpuCounts,
-    treeTotal: 0,
+    treeTotal: 0 as number | string,
     treeVisiblePatches: "0/0",
     treeLodSummary: "0/0/0/0",
     treeGpuSummary: "disabled",
@@ -1839,6 +1879,7 @@ async function main() {
     };
     stones?.updateLighting(stoneLighting);
     treeSystem?.updateLighting(lighting);
+    understorySystem?.updateLighting(lighting);
     waterClipmap.updateSunDirection(lighting.sunDirection);
   };
   const grassSystem = new GrassSystem({
@@ -1869,6 +1910,9 @@ async function main() {
               lod: settings.lod,
               fadeCenter: new THREE.Vector2(controls.target.x, controls.target.z),
               ringInstanceBuffers,
+              hydrologyWaterTexture: hydrologySystem ? hydrologySystem.waterSurfaceTexture() : null,
+              worldSize: worldCells,
+              waterClearance: 0.5,
             }),
           buildGeometry: buildGrassInstancedGeometry,
         }
@@ -1901,6 +1945,7 @@ async function main() {
     worldCells,
     settings: makeStoneSettings(),
     lighting: currentGrassLighting() as StoneLighting,
+    hydrologyWaterTexture: hydrologySystem ? hydrologySystem.waterSurfaceTexture() : null,
     gpuDevice: rendererWebGpuDevice,
     gpuBackend: isWebGpu ? app.renderer.backend as unknown as {
       createStorageAttribute(attribute: THREE.BufferAttribute): void;
@@ -1992,6 +2037,7 @@ async function main() {
     settings: makeTreeSettings(),
     webgpu: isWebGpu,
     lighting: currentLighting(),
+    hydrologyWaterTexture: hydrologySystem ? hydrologySystem.waterSurfaceTexture() : null,
     gpuDevice: rendererWebGpuDevice,
     gpuBackend: isWebGpu ? app.renderer.backend as unknown as {
       createStorageAttribute(attribute: THREE.BufferAttribute): void;
@@ -2010,6 +2056,8 @@ async function main() {
     nodes: understoryPageNodes,
     worldCells,
     settings: makeUnderstorySettings(),
+    webgpu: isWebGpu,
+    lighting: currentLighting(),
   });
   assertPageMeshSignaturesUnchanged(understoryPageSignaturesBefore, pageMeshSignatures(understoryPageNodes));
   let understoryStats: UnderstoryStats | null = understorySystem.getStats();
@@ -2045,7 +2093,7 @@ async function main() {
   // exclusion assertion below mirrors the stones/trees guard.
   const waterPageNodes = allNodes.filter((node) => node.level === 0);
   const waterPageSignaturesBefore = pageMeshSignatures(waterPageNodes);
-  const waterField = new WaterField(waterConfig, { surfaceHeight });
+  const waterField = new WaterField(waterConfig, { surfaceHeight }, hydrologySystem);
   const waterMaterialFactory = isWebGpu
     ? (await import("./water/waterNodeMaterial.js")).createWaterNodeMaterialImpl
     : createWaterShaderMaterial;
@@ -2987,7 +3035,7 @@ async function main() {
   const refreshTreeStats = () => {
     if (!treeSystem) return;
     treeStats = treeSystem.getStats();
-    state.treeTotal = treeStats.totalTrees;
+    state.treeTotal = formatTreeTotalDisplay(treeStats);
     state.treeVisiblePatches = `${treeStats.visiblePatches}/${treeStats.patches}`;
     state.treeLodSummary = `${treeStats.nearTrees}/${treeStats.midTrees}/${treeStats.farTrees}/${treeStats.impostorTrees}`;
     state.treeGpuSummary = formatTreeGpuSummary(treeStats);
@@ -4690,7 +4738,7 @@ async function main() {
       nextTreeStats.gpuOverflowed !== treeStats.gpuOverflowed)
     ) {
       treeStats = nextTreeStats;
-      state.treeTotal = nextTreeStats.totalTrees;
+      state.treeTotal = formatTreeTotalDisplay(nextTreeStats);
       state.treeVisiblePatches = `${nextTreeStats.visiblePatches}/${nextTreeStats.patches}`;
       state.treeLodSummary = `${nextTreeStats.nearTrees}/${nextTreeStats.midTrees}/${nextTreeStats.farTrees}/${nextTreeStats.impostorTrees}`;
       state.treeGpuSummary = formatTreeGpuSummary(nextTreeStats);

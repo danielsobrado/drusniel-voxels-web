@@ -166,3 +166,5 @@ edits, and restores the GUI, texture slots, grass settings, and orbit camera.
 | `src/validate.ts` | Border, degenerate triangle, and mesh validation |
 | `src/main.ts` | Browser viewer entry point |
 | `textures/` | Built-in terrain textures |
+
+License: CC BY-NC-SA.

@@ -1,18 +1,35 @@
 import { describe, expect, it } from "vitest";
 import * as THREE from "three";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { surfaceHeight } from "../terrain.js";
 import { buildLod0PageSource } from "../source_mesh.js";
 import { DEFAULT_DIAGONAL_FLIP_CONFIG, type ClodPagesConfig } from "../config.js";
 import {
   DEFAULT_WATER_CONFIG,
+  HydrologySystem,
+  HYDROLOGY_BODY_LAKE,
+  HYDROLOGY_BODY_RIVER,
   WATER_DEBUG_MODES,
   WaterClipmap,
   WaterField,
+  buildFarWaterSurface,
+  buildMoistureField,
+  buildVisualHydrologyField,
+  buildWaterSurface,
   cloneWaterConfig,
+  computeFlowAccumulation,
+  createHydrologyGrid,
+  fillDepressions,
   parseWaterConfig,
   resolveWaterConfig,
+  carveRiversAndClassifyWater,
   type TerrainHeightSampler,
+  sampleVisualHydrologyField,
+  waterQuadRenderable,
 } from "./index.js";
+import { writeHydrologyDebugDump } from "./hydrologyDump.js";
 import { createWaterShaderMaterial } from "./waterMaterial.js";
 import waterYamlText from "../../config/water.yaml?raw";
 
@@ -53,6 +70,13 @@ describe("parseWaterConfig", () => {
     expect(parsed.fakeBodies.rivers).toHaveLength(1);
     expect(parsed.fakeBodies.rivers[0].pointsNorm).toBeDefined();
     expect(parsed.fakeBodies.rivers[0].pointsNorm!.length).toBe(5);
+    expect(parsed.hydrology.waterSurface.farReduceFactor).toBe(8);
+    expect(parsed.hydrology.waterSurface.farLevelMinCellSize).toBe(12);
+    expect(parsed.hydrology.waterSurface.drySentinelDepth).toBe(2);
+    expect(parsed.hydrology.moisture.enabled).toBe(true);
+    expect(parsed.hydrology.moisture.blurRadius).toBe(4);
+    expect(parsed.hydrology.debug.dumpFields).toBe(false);
+    expect(parsed.hydrology.debug.dumpDir).toBe("qa-runs/hydrology-fields");
 
     const cfg = resolveWaterConfig(parsed, 128);
     expect(cfg.fakeBodies.rivers[0].points).toHaveLength(5);
@@ -73,10 +97,27 @@ describe("parseWaterConfig", () => {
     const cfg = parseWaterConfig("water:\n  debug:\n    mode: 99\n", null);
     expect(cfg.debug.mode).toBe(WATER_DEBUG_MODES.final);
   });
+
+  it("skips rivers with fewer than two valid absolute points", () => {
+    const warnings: string[] = [];
+    const yaml = `water:\n  fake_bodies:\n    lakes: []\n    rivers:\n      - points: [[1, 2]]\n        width: 5\n`;
+    const cfg = parseWaterConfig(yaml, (message) => warnings.push(message));
+    expect(cfg.fakeBodies.rivers).toHaveLength(0);
+    expect(warnings.some((message) => message.includes("[water-config] skipping river entry 0"))).toBe(true);
+  });
+
+  it("skips rivers with fewer than two valid normalized points", () => {
+    const warnings: string[] = [];
+    const yaml = `water:\n  fake_bodies:\n    lakes: []\n    rivers:\n      - points_norm: [[0.25, 0.5]]\n        width: 5\n`;
+    const cfg = parseWaterConfig(yaml, (message) => warnings.push(message));
+    expect(cfg.fakeBodies.rivers).toHaveLength(0);
+    expect(warnings.some((message) => message.includes("[water-config] skipping river entry 0"))).toBe(true);
+  });
 });
 
 describe("WaterField", () => {
   const cfg = resolveWaterConfig(parseWaterConfig(waterYamlText, null), 1000);
+  cfg.source = "fake_bodies";
   const field = new WaterField(cfg, sampler);
 
   it("returns terrainY - sentinel in dry areas (far from any body)", () => {
@@ -87,15 +128,18 @@ describe("WaterField", () => {
     expect(field.depthAt(x, z)).toBeCloseTo(-cfg.drySentinelDepth, 5);
   });
 
-  it("returns a flat lake level inside a lake near its center", () => {
-    const lake = cfg.fakeBodies.lakes[0];
-    const centerLevel = surfaceHeight(lake.center[0], lake.center[1]) + lake.levelOffset;
-    const waterY = field.waterYAt(lake.center[0], lake.center[1]);
-    expect(waterY).toBeCloseTo(centerLevel, 4);
-    // A point offset inside the ellipse stays at the same flat level.
-    const innerX = lake.center[0] + lake.radius[0] * 0.2;
-    const innerZ = lake.center[1] + lake.radius[1] * 0.2;
-    expect(field.waterYAt(innerX, innerZ)).toBeCloseTo(centerLevel, 3);
+  it("bases fake lake level on sampled basin terrain, not the center only", () => {
+    const local = cloneWaterConfig();
+    local.source = "fake_bodies";
+    local.fakeBodies.lakes = [{ center: [0, 0], radius: [20, 20], levelOffset: 1 }];
+    local.fakeBodies.rivers = [];
+    const lakeField = new WaterField(local, {
+      surfaceHeight: (x, z) => (Math.abs(x) < 1e-6 && Math.abs(z) < 1e-6 ? 100 : 10),
+    });
+    const waterY = lakeField.waterYAt(0, 0);
+    expect(waterY).toBeCloseTo(11, 4);
+    expect(waterY).not.toBeCloseTo(101, 4);
+    expect(lakeField.waterYAt(6, 0)).toBeCloseTo(waterY, 4);
   });
 
   it("reports positive body mask inside a lake and zero far away", () => {
@@ -152,6 +196,16 @@ describe("WaterField", () => {
     expect(riverField.bodyMaskAt(50, 11)).toBe(0);
   });
 
+  it("ignores runtime rivers with fewer than two absolute points", () => {
+    const local = cloneWaterConfig();
+    local.fakeBodies.lakes = [];
+    local.fakeBodies.rivers = [{ points: [], width: 20, levelOffset: 4, downstreamDrop: 2 }];
+    const riverField = new WaterField(local, { surfaceHeight: () => 10 });
+    const s = riverField.sample(0, 0);
+    expect(s.bodyMask).toBe(0);
+    expect(s.depth).toBeLessThan(0);
+  });
+
   it("keeps the dry sentinel below terrain outside any body", () => {
     const local = cloneWaterConfig();
     local.drySentinelDepth = 3.5;
@@ -195,6 +249,61 @@ describe("WaterField", () => {
         expect(Number.isFinite(s.flow.drop)).toBe(true);
       }
     }
+  });
+});
+
+describe("VisualHydrologyField", () => {
+  it("derives the render-oriented hydrology contract from the existing grid", () => {
+    const grid = createHydrologyGrid(4, 4, { surfaceHeight: (x, z) => x + z }, 2);
+    const wet = 1 * grid.res + 1;
+    const river = 2 * grid.res + 2;
+    grid.waterY.fill(-2);
+    grid.waterY[wet] = 5;
+    grid.waterY[river] = 4;
+    grid.wetMask[wet] = 1;
+    grid.wetMask[river] = 1;
+    grid.lakeMask[wet] = 1;
+    grid.riverMask[river] = 1;
+    grid.bodyKind[wet] = HYDROLOGY_BODY_LAKE;
+    grid.bodyKind[river] = HYDROLOGY_BODY_RIVER;
+    grid.moisture[wet] = 1;
+    grid.flowDirX[river] = 0.6;
+    grid.flowDirZ[river] = 0.8;
+    grid.flowStrength[river] = 0.5;
+    grid.riverDepth[river] = 2.5;
+    buildFarWaterSurface(grid, 2);
+
+    const field = buildVisualHydrologyField(grid, { farReduceFactor: 2, moistureBlurRadius: 1 });
+
+    expect(field.metadata.resolution).toBe(4);
+    expect(field.metadata.farResolution).toBe(2);
+    expect(field.waterY).toHaveLength(16);
+    expect(field.waterYFar).toHaveLength(4);
+    expect(field.wetMask[wet]).toBe(255);
+    expect(field.bodyKind[wet]).toBe("LakeBasin");
+    expect(field.bodyKind[river]).toBe("RiverChannel");
+    expect(field.flowDirSpeed[river * 2]).toBeCloseTo(0.3);
+    expect(field.flowDirSpeed[river * 2 + 1]).toBeCloseTo(0.4);
+    expect(field.riverDepth[river]).toBeCloseTo(2.5);
+    expect(field.moisture[wet]).toBeGreaterThan(0);
+  });
+
+  it("samples visual hydrology without mutating the source grid", () => {
+    const grid = createHydrologyGrid(4, 4, { surfaceHeight: () => 10 });
+    const i = 1 * grid.res + 1;
+    grid.waterY[i] = 12;
+    grid.wetMask[i] = 1;
+    grid.lakeMask[i] = 1;
+    grid.bodyKind[i] = HYDROLOGY_BODY_LAKE;
+    const before = grid.waterY[i];
+
+    const field = buildVisualHydrologyField(grid, { farReduceFactor: 4, moistureBlurRadius: 0 });
+    const sample = sampleVisualHydrologyField(field, 1.4, 1.4);
+
+    expect(sample.waterY).toBeGreaterThan(0);
+    expect(sample.wetMask).toBe(1);
+    expect(sample.bodyKind).toBe("LakeBasin");
+    expect(grid.waterY[i]).toBe(before);
   });
 });
 
@@ -307,19 +416,15 @@ describe("WaterField terrain-above-water", () => {
   // Math.max(lake.waterLevel, terrainY + 0.05) clamped water above the terrain.
   it("produces negative depth when terrain is above lake level", () => {
     const cfg = cloneWaterConfig();
+    cfg.source = "fake_bodies";
     cfg.fakeBodies.lakes = [{ center: [0, 0], radius: [100, 100], levelOffset: 1.0 }];
     cfg.fakeBodies.rivers = [];
-    // Sampler that returns different heights: low at center (x=0), high elsewhere.
-    // Lake waterLevel is baked from center terrain at construction: 50 + 1.0 = 51.
-    // At x=10 (inside the 100-radius lake): terrain=300, waterY=51 (flat), depth=-249.
+    // A single high spike inside a mostly low basin should not lift the flat lake level.
     const varySampler: TerrainHeightSampler = {
-      surfaceHeight: (x: number) => (x === 0 ? 50 : 300),
+      surfaceHeight: (x: number, z: number) => (Math.abs(x) < 1e-6 && Math.abs(z) < 1e-6 ? 300 : 50),
     };
     const field = new WaterField(cfg, varySampler);
-    // Lake waterLevel = surfaceHeight(0) + 1 = 51 (baked at construction from center).
-    // At x=10 (inside the 100-radius lake): terrain=300, waterY should be 51 (flat).
-    // depth = 51 - 300 = -249, negative => shader discards.
-    const result = field.sample(10, 0);
+    const result = field.sample(0, 0);
     expect(result.waterY).toBe(51);
     expect(result.depth).toBeLessThan(0);
     expect(result.bodyMask).toBeGreaterThan(0);
@@ -344,8 +449,11 @@ describe("parseWaterConfig empty arrays", () => {
 
 describe("Water world-bounds and body-mask clipping constraints", () => {
   it("satisfies the clipping, dry, and wet point assertions", () => {
-    const cfg = resolveWaterConfig(parseWaterConfig(waterYamlText, null), 1000);
-    const field = new WaterField(cfg, sampler);
+    const cfg = cloneWaterConfig();
+    cfg.source = "fake_bodies";
+    cfg.fakeBodies.lakes = [{ center: [100, 100], radius: [30, 30], levelOffset: 2 }];
+    cfg.fakeBodies.rivers = [];
+    const field = new WaterField(cfg, { surfaceHeight: () => 10 });
 
     // 1. A dry point outside any body -> bodyMask = 0 and depth <= 0
     const dryResult = field.sample(1000, 1000);
@@ -353,8 +461,7 @@ describe("Water world-bounds and body-mask clipping constraints", () => {
     expect(dryResult.depth).toBeLessThanOrEqual(0);
 
     // 2. A wet point inside a configured lake -> bodyMask > 0 and depth > 0
-    const lake = cfg.fakeBodies.lakes[0];
-    const wetResult = field.sample(lake.center[0], lake.center[1]);
+    const wetResult = field.sample(100, 100);
     expect(wetResult.bodyMask).toBeGreaterThan(0);
     expect(wetResult.depth).toBeGreaterThan(0);
 
@@ -389,5 +496,238 @@ describe("Water world-bounds and body-mask clipping constraints", () => {
     }
     expect(countOutside).toBeGreaterThan(0);
     clipmap.dispose();
+  });
+});
+
+describe("CPU hydrology modules", () => {
+  const surfaceCfg = cloneWaterConfig().hydrology.waterSurface;
+
+  it("createHydrologyGrid allocates render contract fields", () => {
+    const grid = createHydrologyGrid(8, 8, { surfaceHeight: () => 10 }, 4);
+    expect(grid.waterYFar).toHaveLength(4);
+    expect(grid.farRes).toBe(2);
+    expect(grid.farReduceFactor).toBe(4);
+    expect(grid.moisture).toHaveLength(64);
+    expect(grid.bodyKind).toHaveLength(64);
+  });
+
+  it("depression fill raises an enclosed basin and leaves borders drainable", () => {
+    const grid = createHydrologyGrid(5, 4, { surfaceHeight: () => 10 });
+    grid.originalBed.fill(10);
+    grid.originalBed[2 * 5 + 2] = 0;
+    fillDepressions(grid, {
+      enabled: true,
+      iterations: 20,
+      epsilonPerCell: 0.01,
+      lakeDelta: 2,
+      marshDelta: 0.1,
+    });
+    expect(grid.filledSurface[2 * 5 + 2]).toBeGreaterThan(0);
+    expect(grid.filledSurface[0]).toBe(10);
+  });
+
+  it("lake detection creates flat filled-surface water over a basin", () => {
+    const grid = createHydrologyGrid(9, 8, { surfaceHeight: () => 10 });
+    grid.originalBed.fill(10);
+    grid.carvedBed.set(grid.originalBed);
+    grid.filledSurface.fill(10);
+    for (let z = 2; z <= 6; z++) {
+      for (let x = 2; x <= 6; x++) grid.originalBed[z * 9 + x] = 6;
+    }
+    carveRiversAndClassifyWater(
+      grid,
+      cloneWaterConfig().hydrology.fill,
+      { ...cloneWaterConfig().hydrology.rivers, lakeSurfaceDropM: 0 },
+      { enabled: false, iterations: 0, strength: 0 },
+    );
+    expect(grid.lakeMask[4 * 9 + 4]).toBe(1);
+    expect(grid.waterYRaw[4 * 9 + 4]).toBe(10);
+  });
+
+  it("shallow pits below lake_delta do not become open water", () => {
+    const cfg = cloneWaterConfig().hydrology;
+    const grid = createHydrologyGrid(5, 4, { surfaceHeight: () => 10 });
+    grid.originalBed.fill(10);
+    grid.carvedBed.set(grid.originalBed);
+    grid.filledSurface.fill(10);
+    grid.originalBed[2 * 5 + 2] = 9.5;
+    carveRiversAndClassifyWater(grid, cfg.fill, cfg.rivers, { enabled: false, iterations: 0, strength: 0 });
+    expect(grid.lakeMask[2 * 5 + 2]).toBe(0);
+    expect(grid.waterYRaw[2 * 5 + 2]).toBeLessThan(-1000);
+  });
+
+  it("accumulation on a sloped plane forms downhill flow", () => {
+    const grid = createHydrologyGrid(16, 15, { surfaceHeight: (x) => 30 - x });
+    grid.filledSurface.set(grid.originalBed);
+    computeFlowAccumulation(grid, {
+      particles: 1200,
+      maxSteps: 24,
+      flatGradientStop: 0.0001,
+      inertia: 0.2,
+      jitterSeed: 7,
+    }, cloneWaterConfig().hydrology.fill, {
+      ...cloneWaterConfig().hydrology.rivers,
+      riverThresholdAdd: 0,
+      visibleWaterThresholdAdd: 2,
+      widenRadius: 1,
+    });
+    const mid = 8 * 16 + 8;
+    expect(grid.accumulation[mid]).toBeGreaterThan(0);
+    expect(grid.flowDirX[mid]).toBeGreaterThan(0);
+  });
+
+  it("river carve lowers carvedBed where flowStrength is high", () => {
+    const cfg = cloneWaterConfig().hydrology;
+    const grid = createHydrologyGrid(5, 4, { surfaceHeight: () => 20 });
+    grid.filledSurface.set(grid.originalBed);
+    grid.flowStrength[2 * 5 + 2] = 1;
+    grid.waterStrength[2 * 5 + 2] = 1;
+    carveRiversAndClassifyWater(grid, cfg.fill, cfg.rivers, { enabled: false, iterations: 0, strength: 0 });
+    expect(grid.carvedBed[2 * 5 + 2]).toBeLessThan(20);
+  });
+
+  it("waterY dry cells use 3x3 min bed minus sentinel depth", () => {
+    const grid = createHydrologyGrid(3, 2, { surfaceHeight: () => 10 });
+    grid.carvedBed.fill(10);
+    grid.carvedBed[0] = 4;
+    grid.waterYRaw.fill(-1e4);
+    buildWaterSurface(grid, { ...surfaceCfg, wetSmoothIterations: 0, wetToWetCliffSlopeMax: 1 }, 2);
+    expect(grid.waterY[4]).toBe(2);
+  });
+
+  it("wet-only smoothing does not move dry cells", () => {
+    const grid = createHydrologyGrid(3, 2, { surfaceHeight: () => 10 });
+    grid.carvedBed.fill(10);
+    grid.waterYRaw.fill(-1e4);
+    grid.waterYRaw[4] = 12;
+    buildWaterSurface(grid, { ...surfaceCfg, wetSmoothIterations: 2, wetToWetCliffSlopeMax: 10 }, 2);
+    expect(grid.waterY[0]).toBe(8);
+    expect(grid.wetMask[0]).toBe(0);
+  });
+
+  it("wet-to-wet cliff cut removes steep water ramps", () => {
+    const grid = createHydrologyGrid(3, 2, { surfaceHeight: () => 10 });
+    grid.carvedBed.fill(10);
+    grid.waterYRaw.fill(-1e4);
+    grid.waterYRaw[4] = 10;
+    grid.waterYRaw[5] = 20;
+    buildWaterSurface(grid, { ...surfaceCfg, wetSmoothIterations: 0, wetToWetCliffSlopeMax: 0.1 }, 2);
+    expect(grid.wetMask[4] + grid.wetMask[5]).toBeLessThan(2);
+  });
+
+  it("buildWaterSurface produces finite waterY values", () => {
+    const grid = createHydrologyGrid(4, 4, { surfaceHeight: (x, z) => x + z });
+    grid.carvedBed.set(grid.originalBed);
+    grid.waterYRaw.fill(-1e4);
+    grid.waterYRaw[5] = 8;
+    buildWaterSurface(grid, surfaceCfg, 2);
+    for (const waterY of grid.waterY) expect(Number.isFinite(waterY)).toBe(true);
+  });
+
+  it("buildFarWaterSurface uses conservative min reduction", () => {
+    const grid = createHydrologyGrid(4, 4, { surfaceHeight: () => 0 }, 2);
+    grid.waterY.set([
+      9, 8, 7, 6,
+      5, 4, 3, 2,
+      1, 0, -1, -2,
+      -3, -4, -5, -6,
+    ]);
+    buildFarWaterSurface(grid, 2);
+    expect(grid.farRes).toBe(2);
+    expect(Array.from(grid.waterYFar)).toEqual([4, 2, -4, -6]);
+  });
+
+  it("moisture stays finite and clamped", () => {
+    const grid = createHydrologyGrid(5, 5, { surfaceHeight: () => 0 });
+    grid.bodyKind[12] = HYDROLOGY_BODY_LAKE;
+    grid.wetMask[12] = 1;
+    buildMoistureField(grid, { ...cloneWaterConfig().hydrology.moisture, blurRadius: 2 });
+    for (const value of grid.moisture) {
+      expect(Number.isFinite(value)).toBe(true);
+      expect(value).toBeGreaterThanOrEqual(0);
+      expect(value).toBeLessThanOrEqual(1);
+    }
+    expect(grid.moisture[12]).toBeGreaterThan(0);
+  });
+
+  it("WaterField bilinear hydrology sampling returns finite values", () => {
+    const cfg = cloneWaterConfig();
+    cfg.source = "hydrology";
+    cfg.hydrology.simRes = 16;
+    cfg.hydrology.fill.iterations = 10;
+    cfg.hydrology.accumulation.particles = 200;
+    cfg.hydrology.accumulation.maxSteps = 20;
+    const hydrology = HydrologySystem.build(cfg.hydrology, 32, { surfaceHeight: (x, z) => 20 + z * 0.1 - x * 0.05 });
+    const field = new WaterField(cfg, { surfaceHeight: () => 20 }, hydrology);
+    const s = field.sample(12.3, 18.7);
+    expect(Number.isFinite(s.waterY)).toBe(true);
+    expect(Number.isFinite(s.terrainY)).toBe(true);
+    expect(Number.isFinite(s.depth)).toBe(true);
+  });
+
+  it("river cells can carry flow while lake cells remain calm", () => {
+    const cfg = cloneWaterConfig().hydrology;
+    const grid = createHydrologyGrid(5, 4, { surfaceHeight: () => 20 });
+    const river = 2 * 5 + 2;
+    const lake = 1 * 5 + 1;
+    grid.bodyKind[river] = HYDROLOGY_BODY_RIVER;
+    grid.riverMask[river] = 1;
+    grid.flowStrength[river] = 0.75;
+    grid.flowDirX[river] = 1;
+    grid.bodyKind[lake] = HYDROLOGY_BODY_LAKE;
+    grid.lakeMask[lake] = 1;
+    expect(grid.flowStrength[river]).toBeGreaterThan(0);
+    expect(Math.hypot(grid.flowDirX[lake], grid.flowDirZ[lake]) * cfg.rivers.visibleDepthM).toBe(0);
+  });
+
+  it("sampleForCellSize uses far water only for coarse levels", () => {
+    const cfg = cloneWaterConfig();
+    cfg.source = "hydrology";
+    cfg.hydrology.simRes = 8;
+    cfg.hydrology.waterSurface.farLevelMinCellSize = 4;
+    cfg.hydrology.accumulation.particles = 0;
+    cfg.hydrology.fill.iterations = 0;
+    const hydrology = HydrologySystem.build(cfg.hydrology, 8, { surfaceHeight: () => 0 });
+    hydrology.grid.carvedBed.fill(0);
+    hydrology.grid.wetMask.fill(1);
+    hydrology.grid.waterY.fill(10);
+    hydrology.grid.waterYFar.fill(6);
+    const field = new WaterField(cfg, { surfaceHeight: () => 0 }, hydrology);
+    expect(field.sampleForCellSize(2, 2, 1).waterY).toBeCloseTo(10);
+    expect(field.sampleForCellSize(2, 2, 4).waterY).toBeCloseTo(6);
+  });
+
+  it("debug dump writes tiny synthetic fields", async () => {
+    const grid = createHydrologyGrid(2, 2, { surfaceHeight: () => 1 }, 1);
+    grid.waterY.fill(1);
+    grid.waterYFar.fill(1);
+    const dir = await mkdtemp(join(tmpdir(), "clod-hydrology-"));
+    try {
+      await writeHydrologyDebugDump(grid, dir);
+      const files = await readdir(dir);
+      expect(files).toContain("wet-mask.pgm");
+      expect(files).toContain("water-y-far.pgm");
+      expect(files).toContain("body-kind.ppm");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("water clipmap quad guards", () => {
+  it("skips a quad with one dry corner", () => {
+    const positions = new Float32Array([0, 11, 0, 1, 11, 0, 0, 11, 1, 1, 11, 1]);
+    const terrainY = new Float32Array([10, 10, 10, 10]);
+    const bodyMask = new Float32Array([1, 1, 0, 1]);
+    const flow = new Float32Array(16);
+    expect(waterQuadRenderable([0, 1, 2, 3], positions, terrainY, bodyMask, flow, { cellsX: 4, cellsZ: 4 })).toBe(false);
+  });
+
+  it("skips a quad with a large waterY discontinuity", () => {
+    const positions = new Float32Array([0, 11, 0, 1, 20, 0, 0, 11, 1, 1, 11, 1]);
+    const terrainY = new Float32Array([10, 10, 10, 10]);
+    const bodyMask = new Float32Array([1, 1, 1, 1]);
+    const flow = new Float32Array(16);
+    expect(waterQuadRenderable([0, 1, 2, 3], positions, terrainY, bodyMask, flow, { cellsX: 4, cellsZ: 4 })).toBe(false);
   });
 });
