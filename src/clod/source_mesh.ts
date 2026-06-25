@@ -1,11 +1,62 @@
 // LOD0 page source — built by WELDING same-resolution chunk meshes, never re-extracted.
 
-import { PageMesh, PageFootprint, ClodBuildError } from "../types.js";
+import { PageMesh, PageFootprint, ClodBuildError, triangleCount } from "../types.js";
 import { ClodPagesConfig } from "../config.js";
 import { meshChunk, WorldBounds } from "../terrain/terrain.js";
 import { weldVertices, WeldReport } from "./weld.js";
-import { filterPageSourceSections } from "./pageSource.js";
-import type { PageSourceSection } from "./pageSourceSections.js";
+import { assertMaterialWeights } from "../material/material_weights.js";
+
+/** Sections that may appear in render meshes but must never enter the CLOD page source path. */
+export type PageSourceSection =
+  | "terrain_main"
+  | "water"
+  | "surf"
+  | "deep_ocean"
+  | "debug"
+  | "props";
+
+export const ALLOWED_PAGE_SOURCE_SECTIONS: ReadonlySet<PageSourceSection> = new Set(["terrain_main"]);
+
+export const PAGE_SOURCE_SECTION: PageSourceSection = "terrain_main";
+
+export interface PageSourcePurityReport {
+  terrainTriangles: number;
+  excludedTriangles: number;
+  forbiddenSections: PageSourceSection[];
+}
+
+export function validatePageSourcePurity(
+  meshes: readonly PageMesh[],
+  sections: readonly PageSourceSection[],
+): PageSourcePurityReport {
+  let terrainTriangles = 0;
+  let excludedTriangles = 0;
+  const forbidden = new Set<PageSourceSection>();
+  for (let i = 0; i < meshes.length; i++) {
+    const section = sections[i] ?? PAGE_SOURCE_SECTION;
+    const tris = triangleCount(meshes[i]);
+    if (ALLOWED_PAGE_SOURCE_SECTIONS.has(section)) {
+      terrainTriangles += tris;
+    } else {
+      excludedTriangles += tris;
+      forbidden.add(section);
+    }
+  }
+  return {
+    terrainTriangles,
+    excludedTriangles,
+    forbiddenSections: [...forbidden],
+  };
+}
+
+export function assertPageSourceTerrainOnly(report: PageSourcePurityReport): void {
+  if (report.excludedTriangles > 0 || report.forbiddenSections.length > 0) {
+    throw new ClodBuildError(
+      "ForbiddenPageSourceSection",
+      `page source contains ${report.excludedTriangles} triangles from forbidden sections: ${report.forbiddenSections.join(", ")}`,
+    );
+  }
+}
 
 export interface PageSource {
   mesh: PageMesh;
@@ -13,6 +64,41 @@ export interface PageSource {
   weld: WeldReport;
   /** Unwelded per-chunk meshes, row-major (dz*P + dx). Caller caches these for edits. */
   chunks: PageMesh[];
+}
+
+/** Concatenate several PageMeshes into one buffer (no welding yet). */
+export function concat(meshes: PageMesh[]): PageMesh {
+  let nv = 0, ni = 0;
+  let ws = 0;
+  for (const m of meshes) {
+    nv += m.positions.length / 3;
+    ni += m.indices.length;
+    if (m.materialWeightStride > ws) ws = m.materialWeightStride;
+  }
+  if (ws === 0) ws = 4;
+  const positions = new Float32Array(nv * 3);
+  const normals = new Float32Array(nv * 3);
+  const materials = new Float32Array(nv);
+  const materialWeights = new Float32Array(nv * ws);
+  const indices = new Uint32Array(ni);
+  let vOff = 0, iOff = 0;
+  for (const m of meshes) {
+    assertMaterialWeights(m, "concat input");
+    positions.set(m.positions, vOff * 3);
+    normals.set(m.normals, vOff * 3);
+    materials.set(m.paintSlots, vOff);
+    for (let j = 0; j < m.positions.length / 3; j++) {
+      for (let k = 0; k < ws; k++) {
+        materialWeights[(vOff + j) * ws + k] = j < m.positions.length / 3 && k < m.materialWeightStride
+          ? m.materialWeights[j * m.materialWeightStride + k]
+          : k === 0 ? 1.0 : 0.0;
+      }
+    }
+    for (let i = 0; i < m.indices.length; i++) indices[iOff + i] = m.indices[i] + vOff;
+    vOff += m.positions.length / 3;
+    iOff += m.indices.length;
+  }
+  return { positions, normals, paintSlots: materials, materialWeights, materialWeightStride: ws, indices };
 }
 
 /**
@@ -30,24 +116,21 @@ export function buildLod0PageSource(
   const S = cfg.page.chunk_size;
 
   const chunks: PageMesh[] = [];
+  const chunkSections: PageSourceSection[] = [];
   for (let dz = 0; dz < P; dz++) {
     for (let dx = 0; dx < P; dx++) {
       chunks.push(meshChunk(pageX * P + dx, pageZ * P + dz, cfg, world));
+      chunkSections.push(PAGE_SOURCE_SECTION);
     }
   }
   if (chunks.length !== P * P) {
     throw new ClodBuildError("PageIncomplete", `expected ${P * P} chunks, got ${chunks.length}`);
   }
 
-  const sections: PageSourceSection[] = chunks.map((mesh, index) => ({
-    kind: "mainTerrain",
-    terrainClass: "inland",
-    positionSource: "extracted",
-    label: `chunk-${index}`,
-    mesh,
-  }));
-  const filtered = filterPageSourceSections(sections);
-  const { mesh, report } = weldVertices(filtered.mesh, cfg.simplify.weld_epsilon_cells, {
+  const purity = validatePageSourcePurity(chunks, chunkSections);
+  assertPageSourceTerrainOnly(purity);
+
+  const { mesh, report } = weldVertices(concat(chunks), cfg.simplify.weld_epsilon_cells, {
     position: cfg.validation.position_epsilon,
     normalDot: cfg.validation.normal_dot_min,
     material: cfg.validation.material_weight_epsilon,
@@ -121,14 +204,7 @@ export function rebuildPageChunks(
     const dx = li % P, dz = (li / P) | 0;
     chunkMeshes[li] = meshChunk(pageX * P + dx, pageZ * P + dz, cfg, world);
   }
-  const filtered = filterPageSourceSections(chunkMeshes.map((mesh, index) => ({
-    kind: "mainTerrain",
-    terrainClass: "inland",
-    positionSource: "extracted",
-    label: `chunk-${index}`,
-    mesh,
-  })));
-  const { mesh } = weldVertices(filtered.mesh, cfg.simplify.weld_epsilon_cells, {
+  const { mesh } = weldVertices(concat(chunkMeshes), cfg.simplify.weld_epsilon_cells, {
     position: cfg.validation.position_epsilon,
     normalDot: cfg.validation.normal_dot_min,
     material: cfg.validation.material_weight_epsilon,

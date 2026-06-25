@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import viteConfig from "../vite.config.js";
 
 const projectRoot = resolve(import.meta.dirname, "..");
+const repoRoot = resolve(projectRoot, "../..");
 
 describe("GitHub Pages deployment contract", () => {
   it("builds assets beneath the repository project path", async () => {
@@ -32,13 +33,16 @@ describe("GitHub Pages deployment contract", () => {
   });
 
   it("launches the local dev server at the configured root URL", () => {
+    const rootLauncher = readFileSync(resolve(repoRoot, "scripts/startClodPoc.ps1"), "utf8");
     const localLauncher = readFileSync(resolve(projectRoot, "scripts/startLocal.ps1"), "utf8");
 
-    expect(localLauncher).toContain("$Port = 5180");
-    expect(localLauncher).toContain('$Url = "http://127.0.0.1:$Port/"');
-    expect(localLauncher).toContain('"--port", "$Port", "--strictPort"');
-    expect(localLauncher).not.toContain("drusniel-voxels-bevy/");
-    expect(localLauncher).not.toContain("drusniel-voxels-web/");
+    for (const launcher of [rootLauncher, localLauncher]) {
+      expect(launcher).toContain("$Port = 5180");
+      expect(launcher).toContain('$Url = "http://127.0.0.1:$Port/"');
+      expect(launcher).toContain('"--port", "$Port", "--strictPort"');
+      expect(launcher).not.toContain("drusniel-voxels-bevy/");
+      expect(launcher).not.toContain("drusniel-voxels-web/");
+    }
   });
 
   it("deploys the static build through GitHub Pages", () => {
