@@ -82,6 +82,10 @@ export function runFrameLoopStartup(
     stoneController,
     waterController,
     deepOceanMaterial,
+    deepOceanSurface,
+    waterField,
+    deepOceanConfig,
+    oceanSampler,
     weatherController,
     updateWeatherStats,
     grassSystem,
@@ -99,6 +103,7 @@ export function runFrameLoopStartup(
     forestLightingStats,
     customProps,
   } = input.runtime;
+  const deepOceanMeshPresent = deepOceanSurface !== null;
   const { updateInfo } = infoPanel;
   const { playerTerraformEditActive } = terrainEdit;
   const statsPresenter = statsPresenterFromSession(ctx);
@@ -176,6 +181,10 @@ export function runFrameLoopStartup(
     waterWeather: {
       waterController,
       deepOceanMaterial,
+      waterField,
+      deepOceanConfig,
+      deepOceanMeshPresent,
+      oceanSampler,
       weatherController,
       updateWeatherStats,
       weatherStatsController: session.weatherStatsController,
@@ -201,6 +210,8 @@ export function runFrameLoopStartup(
       maxTerrainLevel,
       farShellBuilt: () => farShellController.isBuilt(),
       farShellCanopyEnabled: () => farShellController.canopyShell !== null,
+      getFarShellMetrics: () => longView.farShellMetrics,
+      infiniteFarShellActive: () => longView.infiniteFarShell !== undefined,
       isLongView: longView.isLongView,
       phase0TargetVisibleM: longView.phase0TargetVisibleM,
       phase0Config: longView.phase0Config,
@@ -210,9 +221,27 @@ export function runFrameLoopStartup(
       phase0Streaming: longView.phase0Streaming,
       longViewDiagnosticsCfg: cfg,
       getFarShellRadiusFactor: () => state.farShellRadiusFactor,
+      getShadowProxyInert: () => {
+        const proxyOn = input.terrainView.shadowProxyDebugState?.shadowProxyEnabled ?? false;
+        const sunOn = input.terrainView.shadowProxyDebugState?.sunShadowsEnabled ?? false;
+        const built = input.terrainView.shadowProxyController?.runtime.stats.built ?? false;
+        return proxyOn && sunOn && built ? 0 : 1;
+      },
+      getShadowProxyEnabled: () => {
+        const counters = input.longView.hooks?.stats?.counters;
+        if (counters && counters["shadow_proxy_enabled"] !== undefined) {
+          return counters["shadow_proxy_enabled"];
+        }
+        const built = input.terrainView.shadowProxyController?.runtime.stats.built ?? false;
+        const proxyOn = input.terrainView.shadowProxyDebugState?.shadowProxyEnabled ?? false;
+        return built && proxyOn ? 1 : 0;
+      },
     },
     farSummary: input.onFarSummaryUpdate ? {
       onFarSummaryUpdate: input.onFarSummaryUpdate,
+    } : undefined,
+    shadowProxy: input.terrainView.shadowProxyController ? {
+      rebuildIfNeeded: () => input.terrainView.shadowProxyController?.rebuildIfNeeded(),
     } : undefined,
   });
 }

@@ -29,6 +29,9 @@ export interface FarShellControllerDeps {
   getLighting: () => EnvironmentLighting;
   getSettings: () => FarShellUiSettings;
   onTriangleCount?: (counter: "far_shell_tris" | "canopy_tris", count: number) => void;
+  receiveSunShadows?: () => boolean;
+  useParityMaterial?: () => boolean;
+  getParityConfig?: () => import("../farTerrain/farTerrainUniforms.js").FarTerrainUniformData | undefined;
   heightProvider?: FarHeightProvider;
   centerX?: number;
   centerZ?: number;
@@ -56,7 +59,7 @@ export function createFarShellController(deps: FarShellControllerDeps): FarShell
   let currentCenterX = deps.centerX ?? deps.worldSizeCells / 2;
   let currentCenterZ = deps.centerZ ?? deps.worldSizeCells / 2;
   let currentHeightProvider = deps.heightProvider;
-  let currentFarRadiusOverride: number | undefined;
+  let currentFarRadiusOverride: number | undefined = deps.farShellRadiusM;
   let buildCenterX = currentCenterX;
   let buildCenterZ = currentCenterZ;
 
@@ -93,6 +96,9 @@ export function createFarShellController(deps: FarShellControllerDeps): FarShell
       centerX: currentCenterX,
       centerZ: currentCenterZ,
       buildRelative: useRelativeBuild,
+      receiveSunShadows: deps.receiveSunShadows?.() ?? false,
+      useParityMaterial: deps.useParityMaterial?.() ?? false,
+      parityConfig: deps.getParityConfig?.(),
     });
     buildCenterX = result.buildCenterX;
     buildCenterZ = result.buildCenterZ;
