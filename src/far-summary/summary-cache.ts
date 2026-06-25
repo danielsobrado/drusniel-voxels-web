@@ -10,6 +10,7 @@ import { buildFarSummaryTile } from "./summary-tile-builder.js";
 export interface FallbackStatsWriter {
   countProceduralFallback(): void;
   countLowerRingFallback(): void;
+  countConservativeFallback(): void;
 }
 
 export class FarSummaryCache implements FallbackStatsWriter {
@@ -19,6 +20,7 @@ export class FarSummaryCache implements FallbackStatsWriter {
   private readonly stats = createFarSummaryStats();
   private frameIndex = 0;
   private commitRevision = 0;
+  private stateRevision = 0;
 
   constructor(config: FarSummaryConfig) {
     this.config = config;
@@ -62,6 +64,7 @@ export class FarSummaryCache implements FallbackStatsWriter {
           existing.state === 'evicted'
         ) {
           existing.state = 'requested';
+          this.stateRevision++;
           this.pendingBuildKeys.set(keyStr, req);
           this.stats.requestedTiles++;
         }
@@ -97,11 +100,11 @@ export class FarSummaryCache implements FallbackStatsWriter {
       if (!existing) continue;
       if (existing.state === 'building') {
         existing.state = 'stale';
+        this.stateRevision++;
         this.pendingBuildKeys.set(build.keyStr, build.req);
         continue;
       }
 
-      const preBuildState = existing.state;
       existing.state = 'building';
       const t0 = performance.now();
       try {
@@ -109,6 +112,7 @@ export class FarSummaryCache implements FallbackStatsWriter {
         if (!ringConfig) {
           console.warn(`[far-summary] missing ring config for ring ${build.ringIndex}`);
           existing.state = 'evicted';
+          this.stateRevision++;
           continue;
         }
         const builtTile = buildFarSummaryTile({
@@ -119,6 +123,7 @@ export class FarSummaryCache implements FallbackStatsWriter {
         if (this.stats.tilesCommittedThisFrame >= commitBudget) {
           const hasSamples = existing.samples.length > 0;
           existing.state = hasSamples ? 'stale' : 'requested';
+          this.stateRevision++;
           this.pendingBuildKeys.set(build.keyStr, build.req);
         } else {
           this.pendingBuildKeys.delete(build.keyStr);
@@ -134,6 +139,7 @@ export class FarSummaryCache implements FallbackStatsWriter {
       } catch (err) {
         console.error(`[far-summary] build failed for ${build.keyStr}:`, err);
         existing.state = 'missing';
+        this.stateRevision++;
       }
     }
   }
@@ -180,12 +186,14 @@ export class FarSummaryCache implements FallbackStatsWriter {
 
   countProceduralFallback(): void { this.stats.proceduralFallbacks++; }
   countLowerRingFallback(): void { this.stats.lowerRingFallbacks++; }
+  countConservativeFallback(): void { this.stats.conservativeFallbacks++; }
 
   markStale(_boundsOrPredicate: unknown): void {
     const now = this.frameIndex;
     for (const [, tile] of this.tiles) {
       if (tile.state === 'ready' && tile.lastTouchedFrame < now - 1) {
         tile.state = 'stale';
+        this.stateRevision++;
       }
     }
   }
@@ -196,15 +204,19 @@ export class FarSummaryCache implements FallbackStatsWriter {
     for (const [_ks, tile] of this.tiles) {
       if (tile.state === 'ready' && tile.lastTouchedFrame < frameIndex - 2) {
         tile.state = 'cooling';
+        this.stateRevision++;
       }
       if (tile.state === 'cooling' && (nowMs - tile.lastTouchedTimeMs) > graceMs) {
         tile.state = 'evicted';
+        this.stateRevision++;
       }
       if (tile.state === 'cooling' && tile.lastTouchedFrame >= frameIndex - 1) {
         tile.state = 'stale';
+        this.stateRevision++;
       }
       if (tile.state === 'stale' && tile.lastTouchedFrame < frameIndex - 5) {
         tile.state = 'cooling';
+        this.stateRevision++;
       }
     }
     let evicted = 0;
@@ -216,6 +228,8 @@ export class FarSummaryCache implements FallbackStatsWriter {
 
   commitRevisionAt(): number { return this.commitRevision; }
   hasNewCommitsSince(revision: number): boolean { return this.commitRevision > revision; }
+  stateRevisionAt(): number { return this.stateRevision; }
+  hasStateChangesSince(revision: number): boolean { return this.stateRevision > revision; }
 
   forEachTile(fn: (tile: FarSummaryTile) => void): void {
     for (const tile of this.tiles.values()) fn(tile);

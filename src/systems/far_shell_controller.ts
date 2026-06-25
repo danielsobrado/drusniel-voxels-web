@@ -3,6 +3,7 @@ import type { TerrainSummaryField } from "../clod/terrain_summary.js";
 import { createExtendedCanopyTexture, createExtendedHeightTexture } from "../clod/terrain_summary.js";
 import { buildFarCanopyShell } from "../gpu/far_canopy_shell.js";
 import { buildFarTerrainShell, type FarHeightProvider } from "../gpu/far_terrain_shell.js";
+import { FAR_SHELL_DEFAULTS } from "../app/clod_constants.js";
 import type { EnvironmentLighting } from "../environment/environment.js";
 
 export interface FarShellInstance {
@@ -31,6 +32,9 @@ export interface FarShellControllerDeps {
   heightProvider?: FarHeightProvider;
   centerX?: number;
   centerZ?: number;
+  /** Override the shell far radius in world units. When set, the shell radius is
+   *  this value instead of worldSizeCells * radiusFactor. */
+  farShellRadiusM?: number;
 }
 
 export interface FarShellController {
@@ -39,9 +43,11 @@ export interface FarShellController {
   isBuilt(): boolean;
   readonly canopyShell: FarShellInstance | null;
   dispose(): void;
-  /** Move the shell mesh to a new world center without rebuilding. */
   moveTo(x: number, z: number): void;
+  /** Set or change the height provider after construction. Rebuilds the shell. */
   setHeightProvider(provider: FarHeightProvider | undefined): void;
+  /** Override the shell far radius (world units). Pass 0 to clear the override. */
+  setFarRadiusOverride(m: number): void;
 }
 
 export function createFarShellController(deps: FarShellControllerDeps): FarShellController {
@@ -50,6 +56,7 @@ export function createFarShellController(deps: FarShellControllerDeps): FarShell
   let currentCenterX = deps.centerX ?? deps.worldSizeCells / 2;
   let currentCenterZ = deps.centerZ ?? deps.worldSizeCells / 2;
   let currentHeightProvider = deps.heightProvider;
+  let currentFarRadiusOverride = 0;
   let buildCenterX = currentCenterX;
   let buildCenterZ = currentCenterZ;
 
@@ -64,13 +71,14 @@ export function createFarShellController(deps: FarShellControllerDeps): FarShell
       current.dispose();
     }
     const lighting = deps.getLighting();
+    const farRadius = currentFarRadiusOverride ?? deps.farShellRadiusM ?? deps.worldSizeCells * radiusFactor;
     const result = buildFarTerrainShell(deps.terrainSummary, {
       sunDirection: lighting.sunDirection,
       sunColor: lighting.sunColor,
       skyLight: lighting.skyLight,
       groundLight: lighting.groundLight,
     }, {
-      farRadius: deps.worldSizeCells * radiusFactor,
+      farRadius,
       gridRes: 128,
       heightDrop,
       heightBias,
@@ -109,12 +117,18 @@ export function createFarShellController(deps: FarShellControllerDeps): FarShell
     currentCenterZ = z;
   };
 
-  current = buildFarShellInstance(1.5, 0.6, 2, false);
-  if (!deps.isLongView && !deps.queryFarShell) {
+  const initialSettings = deps.getSettings();
+  current = buildFarShellInstance(
+    initialSettings.radiusFactor,
+    initialSettings.heightBias,
+    initialSettings.heightDrop,
+    currentHeightProvider !== undefined,
+  );
+  if (!initialSettings.enabled && !deps.isLongView && !deps.queryFarShell) {
     deps.scene.remove(current.mesh);
   }
 
-  const canopyFarRadius = deps.worldSizeCells * 1.5;
+  const canopyFarRadius = deps.worldSizeCells * FAR_SHELL_DEFAULTS.radiusFactor;
   if (deps.isLongView || deps.queryCanopy) {
     const canopyHeightTexture = createExtendedHeightTexture(deps.terrainSummary, canopyFarRadius);
     const canopyCoverageTexture = createExtendedCanopyTexture(deps.terrainSummary, canopyFarRadius, 42);
@@ -137,6 +151,10 @@ export function createFarShellController(deps: FarShellControllerDeps): FarShell
     setHeightProvider(provider: FarHeightProvider | undefined) {
       currentHeightProvider = provider;
       rebuild();
+    },
+    setFarRadiusOverride(m: number) {
+      currentFarRadiusOverride = m;
+      if (m > 0) rebuild();
     },
     setEnabled(on) {
       if (!current) return;
