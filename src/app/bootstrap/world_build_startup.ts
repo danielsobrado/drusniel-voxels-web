@@ -5,14 +5,29 @@ import { emitAudio } from "../../audio/index.js";
 import {
   baseSurfaceHeight,
   getDigEditsSnapshot,
+  getDigEditRevision,
   replaceDigEdits,
   setTerrainSurfaceOverride,
   setBorderCoastRuntime,
   parseBorderCoastOceanConfig,
   type BorderCoastOceanConfig,
 } from "../../terrain/terrain.js";
-import { buildTerrainSummary } from "../../clod/terrain_summary.js";
 import { publishTerrainSummaryForDiagnostics } from "./diagnostics_startup.js";
+import {
+  initClodCacheContext,
+  loadTerrainSummaryWithCacheSimple,
+  createCacheDebugOverlay,
+  isCacheSessionDisabled,
+  setCacheSessionDisabled,
+  type ClodCacheContext,
+} from "../../cache/index.js";
+import {
+  buildProceduralTextureHash,
+  buildStagedImportHash,
+  type TerrainSourceInputs,
+} from "../../cache/terrainSource.js";
+import { clearWorkerCacheSnapshot } from "../../cache/cacheMetricsBridge.js";
+import type { TerrainSummaryField } from "../../clod/terrain_summary.js";
 import { bakeMacroTint } from "../../gpu/terrain_node_material.js";
 import { aggregateDiagonalPolishStats, formatDiagonalPolishStats } from "../../diagonalPolish.js";
 import { parseProceduralTextureConfig } from "../../textures/materialRecipes.js";
@@ -44,6 +59,7 @@ import proceduralConfigText from "../../../config/procedural_textures.yaml?raw";
 import grassConfigText from "../../../config/grass.yaml?raw";
 import waterConfigText from "../../../config/water.yaml?raw";
 import borderCoastOceanConfigText from "../../../config/border_coast_ocean.yaml?raw";
+import borderOceanSceneConfigText from "../../../config/border_ocean_scene.yaml?raw";
 import forestLightingConfigText from "../../../config/forest_lighting.yaml?raw";
 import customPropsConfigText from "../../../config/custom_props.yaml?raw";
 import customPropPlacementsText from "../../../config/custom_prop_placements.yaml?raw";
@@ -54,6 +70,7 @@ import { parseCustomPropsConfig } from "../../props/prop_config.js";
 import { parsePropPlacements } from "../../props/prop_placements.js";
 import type { CustomPropsSettings } from "../../props/prop_types.js";
 import type { PropPlacementScene } from "../../props/prop_types.js";
+import { parseBorderOceanSceneConfig } from "../../debug/border_ocean_scene.js";
 import { splitWorldBuildNodes } from "./world_build_nodes.js";
 
 export interface WorldBuildStartupInput {
@@ -64,6 +81,7 @@ export interface WorldBuildStartupInput {
   queryTreePerfScene: boolean;
   queryForestFloorScene: boolean;
   queryLongViewScene: boolean;
+  queryBorderOceanScene: boolean;
   buildProgress: HTMLElement;
   buildProgressPhase: HTMLElement;
   buildProgressPercent: HTMLElement;
@@ -92,7 +110,7 @@ export interface WorldBuildResult {
   lod0Nodes: ClodPageNode[];
   allNodes: ClodPageNode[];
   maxTerrainLevel: number;
-  terrainSummary: ReturnType<typeof buildTerrainSummary>;
+  terrainSummary: TerrainSummaryField;
   result: Awaited<ReturnType<ClodWorkerClient["buildWorld"]>>;
   hydrologySystem: HydrologySystem | null;
   polishLine: string;
@@ -108,6 +126,7 @@ export async function runWorldBuildStartup(input: WorldBuildStartupInput): Promi
     queryTreePerfScene,
     queryForestFloorScene,
     queryLongViewScene,
+    queryBorderOceanScene,
     buildProgress,
     buildProgressPhase,
     buildProgressPercent,
@@ -131,6 +150,7 @@ export async function runWorldBuildStartup(input: WorldBuildStartupInput): Promi
   };
   let waterConfig = parseWaterConfig(waterConfigText);
   const borderCoastOceanConfig = parseBorderCoastOceanConfig(borderCoastOceanConfigText);
+  const borderOceanSceneConfig = parseBorderOceanSceneConfig(borderOceanSceneConfigText);
   const proceduralTextureConfig = parseProceduralTextureConfig(proceduralConfigText);
   const proceduralTerrain = proceduralTextureConfig.enabled
     ? createProceduralTerrainTextures(proceduralTextureConfig)
@@ -145,9 +165,11 @@ export async function runWorldBuildStartup(input: WorldBuildStartupInput): Promi
   const WORLD = stagedImport?.manifest.worldSize ?? (
     clodRuntime.runtime.worldOptions.includes(requested)
       ? requested
-      : queryGrassPerfScene || queryTreePerfScene || queryForestFloorScene || queryLongViewScene
-        ? 16
-        : 4
+      : queryGrassPerfScene || queryTreePerfScene || queryForestFloorScene || queryLongViewScene || queryBorderOceanScene
+        ? queryBorderOceanScene
+          ? borderOceanSceneConfig.defaultWorldPages
+          : 16
+        : 8
   );
   const worldCells = WORLD * cfg.page.chunks_per_page * cfg.page.chunk_size;
 
@@ -178,7 +200,13 @@ export async function runWorldBuildStartup(input: WorldBuildStartupInput): Promi
   });
   updateBuildOverlay();
 
+  const cacheParam = searchParams.get("cache");
+  const cacheDisabled = cacheParam === "0" || cacheParam === "false";
+  if (cacheDisabled) setCacheSessionDisabled(true);
+  clearWorkerCacheSnapshot();
+
   if (stagedImport) replaceDigEdits(stagedImport.manifest.terrainEdits);
+
   const preHydrologyTerrain = makeFakeBodyCarvedSampler(waterConfig, { surfaceHeight: baseSurfaceHeight });
   const hydrologySystem = waterConfig.enabled && waterConfig.source === "hydrology" && waterConfig.hydrology.enabled
     ? HydrologySystem.build(waterConfig.hydrology, worldCells, preHydrologyTerrain)
@@ -198,6 +226,42 @@ export async function runWorldBuildStartup(input: WorldBuildStartupInput): Promi
         carvedBed: hydrologySystem.grid.carvedBed,
       }
     : null;
+
+  const scene = searchParams.get("scene") ?? "default";
+  const proceduralTextureHash = await buildProceduralTextureHash(
+    proceduralTextureConfig.enabled,
+    proceduralTextureConfig.enabled
+      ? `${proceduralTextureConfig.seed}:${proceduralTextureConfig.noise.resolution}`
+      : null,
+  );
+  const stagedImportHash = await buildStagedImportHash(stagedImport?.manifest ?? null);
+  const terrainSource: TerrainSourceInputs = {
+    scene,
+    worldSeed: "0",
+    worldPages: WORLD,
+    generatorVersion: cfg.meshopt_package_version,
+    digRevision: getDigEditRevision(),
+    hydrologyTerrain,
+    borderCoastOceanConfig,
+    waterConfig: {
+      enabled: waterConfig.enabled,
+      source: waterConfig.source,
+      fakeBodies: { carveTerrain: waterConfig.fakeBodies.carveTerrain },
+      hydrology: { enabled: waterConfig.hydrology.enabled },
+    },
+    proceduralTextureEnabled: proceduralTextureConfig.enabled,
+    proceduralTextureHash,
+    stagedImportHash,
+    longViewScene: queryLongViewScene,
+  };
+
+  let cacheCtx: ClodCacheContext | null = await initClodCacheContext({
+    cfg,
+    worldPages: WORLD,
+    terrainSource,
+    forceDisabled: cacheDisabled,
+    role: "main",
+  });
 
   const buildNote =
     WORLD >= 16 ? " (worker build; large world may take a while)" :
@@ -220,7 +284,7 @@ export async function runWorldBuildStartup(input: WorldBuildStartupInput): Promi
     info.textContent = `building ${WORLD}x${WORLD} world… ${Math.floor(fraction * 100)}%\n${phase}  L${level}  ${done}/${total}`;
     buildStatus.value = `${phase} L${level} ${done}/${total}`;
     updateBuildOverlay();
-  }, hydrologyTerrain, borderCoastOceanConfig);
+  }, hydrologyTerrain, borderCoastOceanConfig, cacheDisabled || isCacheSessionDisabled(), terrainSource);
 
   buildProgress.hidden = true;
   buildStatus.value = "ready";
@@ -228,8 +292,15 @@ export async function runWorldBuildStartup(input: WorldBuildStartupInput): Promi
   const { lod0Nodes, allNodes } = splitWorldBuildNodes(result.nodesByLevel);
   const maxTerrainLevel = Math.max(...result.nodesByLevel.keys());
   const worldSizeCells = WORLD * cfg.page.chunks_per_page * cfg.page.chunk_size;
-  const terrainSummary = buildTerrainSummary(lod0Nodes, worldSizeCells, 8);
+  const summaryResult = await loadTerrainSummaryWithCacheSimple(
+    lod0Nodes,
+    worldSizeCells,
+    8,
+    cacheCtx,
+  );
+  const terrainSummary = summaryResult.summary;
   publishTerrainSummaryForDiagnostics(terrainSummary);
+  createCacheDebugOverlay({ clearWorkerCache: () => clodWorker.clearCache() })?.update();
 
   return {
     cfg,

@@ -9,6 +9,9 @@ import type {
 import type { DigEdit } from "./terrain/terrain.js";
 import type { BorderCoastOceanConfig } from "./terrain/border_coast_config.js";
 import type { ClodPageNode, PageFootprint, PageMesh } from "./types.js";
+import type { TerrainSourceInputs } from "./cache/terrainSource.js";
+import type { WorkerCacheBuildStats } from "./cache/cacheMetrics.js";
+import type { ClodCacheMetrics } from "./cache/cacheMetrics.js";
 
 export interface SerializedHydrologyTerrain {
   res: number;
@@ -45,6 +48,9 @@ export type ClodWorkerRequest =
       edits: DigEdit[];
       hydrologyTerrain?: SerializedHydrologyTerrain | null;
       borderCoastOceanConfig?: BorderCoastOceanConfig | null;
+      cacheDisabled?: boolean;
+      digRevision?: number;
+      terrainSource: TerrainSourceInputs;
     }
   | {
       type: "dig";
@@ -54,6 +60,10 @@ export type ClodWorkerRequest =
     }
   | {
       type: "flush";
+      requestId: number;
+    }
+  | {
+      type: "clearCache";
       requestId: number;
     };
 
@@ -80,11 +90,18 @@ export interface SerializedParentBatch {
 
 export type ClodWorkerResponse =
   | ({ type: "progress"; requestId: number } & BuildProgress)
-  | { type: "buildComplete"; requestId: number; result: SerializedBuildResult }
+  | {
+      type: "buildComplete";
+      requestId: number;
+      result: SerializedBuildResult;
+      cacheBuildStats?: WorkerCacheBuildStats;
+      cacheServiceMetrics?: ClodCacheMetrics;
+    }
   | ({ type: "lod0Rebuilt" } & SerializedLod0RebuildResult)
   | ({ type: "parentRebuilt" } & SerializedParentBatch)
   | { type: "parentsComplete"; requestId: number | null; parentNodes: number; parentMs: number }
   | { type: "flushed"; requestId: number }
+  | { type: "cacheCleared"; requestId: number }
   | { type: "error"; requestId: number | null; message: string; name?: string; code?: string; details?: Record<string, unknown> };
 
 function cloneMesh(mesh: PageMesh): PageMesh {

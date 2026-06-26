@@ -60,6 +60,21 @@ describe("canopy clipmap", () => {
     );
   });
 
+  it("skips tile builds when clipmap is disabled", () => {
+    const clipmap = createCanopyClipmap();
+    clipmap.update(0, 0, config, terrain, trees);
+    expect(clipmap.getVisibleTiles().length).toBeGreaterThan(0);
+
+    const disabled = {
+      ...config,
+      clipmap: { ...config.clipmap, enabled: false },
+    };
+    const update = clipmap.update(0, 0, disabled, terrain, trees);
+    expect(clipmap.getVisibleTiles()).toHaveLength(0);
+    expect(update.metrics.builtThisFrame).toBe(0);
+    expect(update.texturesDirty).toBe(true);
+  });
+
   it("texture revision changes after clipmap warms at a new camera position", () => {
     const clipmap = createCanopyClipmap();
     clipmap.update(0, 0, config, terrain, trees);
@@ -86,5 +101,24 @@ describe("canopy clipmap", () => {
     });
     expect(setB.revision).toBeGreaterThan(setA.revision);
     expect(setB.heightTexture).not.toBe(setA.heightTexture);
+  });
+
+  it("does not mark textures dirty when queue remains but no tile was built", () => {
+    const clipmap = createCanopyClipmap();
+    const noBuildConfig = {
+      ...config,
+      budgets: { ...config.budgets, maxTilesBuiltPerFrame: 0 },
+    };
+
+    clipmap.update(0, 0, config, terrain, trees);
+    while (clipmap.getVisibleTiles().length === 0) {
+      clipmap.update(0, 0, config, terrain, trees);
+    }
+
+    const update = clipmap.update(1024, 0, noBuildConfig, terrain, trees);
+
+    expect(update.metrics.builtThisFrame).toBe(0);
+    expect(update.metrics.queuedTiles).toBeGreaterThan(0);
+    expect(update.texturesDirty).toBe(false);
   });
 });

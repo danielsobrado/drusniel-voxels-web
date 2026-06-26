@@ -8,6 +8,10 @@ import {
   type DirtyCellBounds,
   type NodeIndex,
 } from "./clod/quadtree.js";
+import { initClodCacheContext, clearWorkerPersistentCache, type ClodCacheContext } from "./cache/clodCacheContext.js";
+import { isCacheRpcResponse } from "./cache/cacheWorkerRpc.js";
+import { dispatchCacheRpcResponse } from "./cache/workerRemotePersistentStore.js";
+import { createBuildCacheHooks, type CachedBuildStats } from "./cache/clodBuildCache.js";
 import { addDigEdit, replaceDigEdits, setBorderCoastRuntime, setTerrainSurfaceOverride } from "./terrain/terrain.js";
 import {
   collectBuildResultTransferables,
@@ -26,6 +30,7 @@ const ctx = self as unknown as {
 };
 
 let cfg: ClodPagesConfig | null = null;
+let workerCacheCtx: ClodCacheContext | null = null;
 let result: BuildResult | null = null;
 let index: NodeIndex | null = null;
 let topLevel = 0;
@@ -196,16 +201,46 @@ async function handleBuild(request: Extract<ClodWorkerRequest, { type: "build" }
   parentNodes = 0;
   parentMs = 0;
   await initSimplifier();
+
+  const cacheCtx = await initClodCacheContext({
+    cfg: request.cfg,
+    worldPages: request.worldPagesX,
+    terrainSource: request.terrainSource,
+    forceDisabled: request.cacheDisabled ?? false,
+    role: "worker",
+  });
+  workerCacheCtx = cacheCtx;
+  const cacheStats: CachedBuildStats = {
+    nodesFromCache: 0,
+    nodesBuilt: 0,
+    cacheHits: 0,
+    cacheMisses: 0,
+    coldBuildMsAvoided: 0,
+    cacheDecodeMs: 0,
+    netSavedMs: 0,
+    coldBuildMs: 0,
+  };
+  const cacheHooks = cacheCtx?.effective ? createBuildCacheHooks(cacheCtx, cacheStats) : undefined;
+
   result = await buildWorldAsync(
     request.worldPagesX,
     request.worldPagesZ,
     cfg,
     (progress) => post({ type: "progress", requestId: request.requestId, ...progress }),
+    cacheHooks,
   );
+  if (cacheCtx) await cacheCtx.service.flush();
   index = buildNodeIndex(result);
   topLevel = Math.max(...result.nodesByLevel.keys());
   const serialized = serializeBuildResult(result);
-  post({ type: "buildComplete", requestId: request.requestId, result: serialized }, collectBuildResultTransferables(serialized));
+  const cacheServiceMetrics = cacheCtx?.service.getMetrics();
+  post({
+    type: "buildComplete",
+    requestId: request.requestId,
+    result: serialized,
+    cacheBuildStats: cacheCtx?.effective ? cacheStats : undefined,
+    cacheServiceMetrics: cacheCtx?.effective ? cacheServiceMetrics : undefined,
+  }, collectBuildResultTransferables(serialized));
 }
 
 function queueCoalescedDig(requestId: number, dirty: DirtyCellBounds): void {
@@ -288,13 +323,29 @@ function handleFlush(request: Extract<ClodWorkerRequest, { type: "flush" }>): vo
   post({ type: "flushed", requestId: request.requestId });
 }
 
+async function handleClearCache(request: Extract<ClodWorkerRequest, { type: "clearCache" }>): Promise<void> {
+  if (workerCacheCtx) {
+    await workerCacheCtx.service.clear();
+    workerCacheCtx = null;
+  } else {
+    await clearWorkerPersistentCache();
+  }
+  post({ type: "cacheCleared", requestId: request.requestId });
+}
+
 ctx.onmessage = (event: MessageEvent<ClodWorkerRequest>) => {
+  if (isCacheRpcResponse(event.data)) {
+    dispatchCacheRpcResponse(event.data);
+    return;
+  }
   const request = event.data;
   try {
     if (request.type === "build") {
       void handleBuild(request).catch((error) => post(errorResponse(request.requestId, error)));
     } else if (request.type === "dig") {
       handleDig(request);
+    } else if (request.type === "clearCache") {
+      void handleClearCache(request).catch((error) => post(errorResponse(request.requestId, error)));
     } else {
       handleFlush(request);
     }

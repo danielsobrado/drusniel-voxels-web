@@ -108,6 +108,29 @@ export function createCanopyClipmap(): CanopyClipmap {
       lastCenterX = centerX;
       lastCenterZ = centerZ;
 
+      if (!config.clipmap.enabled) {
+        const evicted = tiles.size;
+        if (evicted > 0) {
+          tiles.clear();
+          tileRing.clear();
+          staleSince.clear();
+          rebuildQueue.length = 0;
+          metrics.evictedTiles = evicted;
+        }
+        metrics.requestedTiles = 0;
+        metrics.builtThisFrame = 0;
+        metrics.queuedTiles = 0;
+        metrics.builtTiles = 0;
+        metrics.visibleTiles = 0;
+        metrics.buildMs = performance.now() - t0;
+        return {
+          metrics: { ...metrics },
+          texturesDirty: evicted > 0,
+          centerX,
+          centerZ,
+        };
+      }
+
       const wanted = wantedTileMap(centerX, centerZ, config);
       metrics.requestedTiles = wanted.size;
       metrics.builtThisFrame = 0;
@@ -160,6 +183,7 @@ export function createCanopyClipmap(): CanopyClipmap {
         built++;
       }
       metrics.builtThisFrame = built;
+      metrics.queuedTiles = rebuildQueue.length;
       metrics.builtTiles = tiles.size;
       metrics.visibleTiles = tiles.size;
       metrics.buildMs = performance.now() - t0;
@@ -180,7 +204,7 @@ export function createCanopyClipmap(): CanopyClipmap {
 
       return {
         metrics: { ...metrics },
-        texturesDirty: built > 0 || metrics.evictedTiles > 0 || rebuildQueue.length > 0,
+        texturesDirty: built > 0 || metrics.evictedTiles > 0,
         centerX,
         centerZ,
       };

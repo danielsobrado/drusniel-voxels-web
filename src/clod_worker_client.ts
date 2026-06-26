@@ -3,6 +3,10 @@ import type { DigEdit } from "./terrain/terrain.js";
 import type { BorderCoastOceanConfig } from "./terrain/border_coast_config.js";
 import type { ClodPageNode } from "./types.js";
 import type { ClodPagesConfig } from "./config.js";
+import type { TerrainSourceInputs } from "./cache/terrainSource.js";
+import { setWorkerCacheSnapshot } from "./cache/cacheMetricsBridge.js";
+import { attachMainThreadCacheBroker } from "./cache/mainThreadCacheBroker.js";
+import { isCacheRpcMessage } from "./cache/cacheWorkerRpc.js";
 import {
   applySerializedNode,
   indexNodes,
@@ -65,6 +69,7 @@ export class ClodWorkerClient {
   private buildRequests = new Map<number, PendingRequest<BuildResult>>();
   private digRequests = new Map<number, PendingRequest<WorkerLod0Rebuild>>();
   private flushRequests = new Map<number, PendingRequest<void>>();
+  private clearCacheRequests = new Map<number, PendingRequest<void>>();
   private progressHandlers = new Map<number, (progress: BuildProgress) => void>();
   private digPending: DigBatchSlot | null = null;
   private digPumpActive = false;
@@ -74,7 +79,11 @@ export class ClodWorkerClient {
   private parentsWaiters: Array<() => void> = [];
 
   constructor() {
-    this.worker.onmessage = (event: MessageEvent<ClodWorkerResponse>) => this.handleMessage(event.data);
+    attachMainThreadCacheBroker(this.worker);
+    this.worker.onmessage = (event: MessageEvent) => {
+      if (isCacheRpcMessage(event.data)) return;
+      this.handleMessage(event.data as ClodWorkerResponse);
+    };
     this.worker.onerror = (event) => {
       const error = new Error(event.message || "CLOD worker failed");
       this.rejectAll(error);
@@ -90,6 +99,8 @@ export class ClodWorkerClient {
     onProgress: (progress: BuildProgress) => void,
     hydrologyTerrain: SerializedHydrologyTerrain | null = null,
     borderCoastOceanConfig: BorderCoastOceanConfig | null = null,
+    cacheDisabled = false,
+    terrainSource: TerrainSourceInputs,
   ): Promise<BuildResult> {
     const requestId = this.nextRequestId++;
     const request: ClodWorkerRequest = {
@@ -101,6 +112,8 @@ export class ClodWorkerClient {
       edits,
       hydrologyTerrain,
       borderCoastOceanConfig,
+      cacheDisabled,
+      terrainSource,
     };
     this.progressHandlers.set(requestId, onProgress);
     return new Promise((resolve, reject) => {
@@ -131,6 +144,15 @@ export class ClodWorkerClient {
     const request: ClodWorkerRequest = { type: "flush", requestId };
     return new Promise((resolve, reject) => {
       this.flushRequests.set(requestId, { resolve, reject });
+      this.worker.postMessage(request);
+    });
+  }
+
+  clearCache(): Promise<void> {
+    const requestId = this.nextRequestId++;
+    const request: ClodWorkerRequest = { type: "clearCache", requestId };
+    return new Promise((resolve, reject) => {
+      this.clearCacheRequests.set(requestId, { resolve, reject });
       this.worker.postMessage(request);
     });
   }
@@ -192,6 +214,9 @@ export class ClodWorkerClient {
   }
 
   private handleMessage(message: ClodWorkerResponse): void {
+    if (!message || typeof message !== "object" || typeof message.type !== "string") {
+      return;
+    }
     switch (message.type) {
       case "progress":
         this.progressHandlers.get(message.requestId)?.(message);
@@ -203,6 +228,7 @@ export class ClodWorkerClient {
         this.progressHandlers.delete(message.requestId);
         this.result = rehydrateBuildResult(message.result);
         this.nodesById = indexNodes(this.result);
+        setWorkerCacheSnapshot(message.cacheBuildStats ?? null, message.cacheServiceMetrics ?? null);
         pending.resolve(this.result);
         break;
       }
@@ -248,6 +274,14 @@ export class ClodWorkerClient {
         pending.resolve();
         break;
       }
+      case "cacheCleared": {
+        const pending = this.clearCacheRequests.get(message.requestId);
+        if (!pending) break;
+        this.clearCacheRequests.delete(message.requestId);
+        setWorkerCacheSnapshot(null, null);
+        pending.resolve();
+        break;
+      }
       case "error":
         this.handleError(message.requestId, new Error(message.message));
         break;
@@ -282,11 +316,13 @@ export class ClodWorkerClient {
       const pending =
         this.buildRequests.get(requestId) ??
         this.digRequests.get(requestId) ??
-        this.flushRequests.get(requestId);
+        this.flushRequests.get(requestId) ??
+        this.clearCacheRequests.get(requestId);
       if (pending) {
         this.buildRequests.delete(requestId);
         this.digRequests.delete(requestId);
         this.flushRequests.delete(requestId);
+        this.clearCacheRequests.delete(requestId);
         pending.reject(error);
         return;
       }
@@ -303,6 +339,7 @@ export class ClodWorkerClient {
     for (const pending of this.buildRequests.values()) pending.reject(error);
     for (const pending of this.digRequests.values()) pending.reject(error);
     for (const pending of this.flushRequests.values()) pending.reject(error);
+    for (const pending of this.clearCacheRequests.values()) pending.reject(error);
     if (this.digPending) {
       for (const pending of this.digPending.resolvers) pending.reject(error);
       this.digPending = null;
@@ -310,6 +347,7 @@ export class ClodWorkerClient {
     this.buildRequests.clear();
     this.digRequests.clear();
     this.flushRequests.clear();
+    this.clearCacheRequests.clear();
     this.progressHandlers.clear();
     this.resolveParentsWaiters();
   }
