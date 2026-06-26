@@ -59,7 +59,7 @@ export function runStoneStartup(input: StoneStartupInput): StoneStartupResult {
     worldCells,
     stoneConfig,
     hydrologyWaterTexture: hydrologySystem ? hydrologySystem.waterSurfaceTexture() : null,
-    hydrologyData: stoneHydrologyData,
+    hydrologyGpuData: stoneHydrologyData,
     gpuDevice: rendererWebGpuDevice,
     gpuBackend,
     getUiState: () => stoneUiState(state),
