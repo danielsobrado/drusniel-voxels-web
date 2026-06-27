@@ -145,38 +145,51 @@ export function buildFarTerrainShell(
     }
   }
 
-  const quadRadiusBounds = (x0: number, z0: number, x1: number, z1: number): { min: number; max: number } => {
-    const wx0 = buildRelative ? x0 + centerX : x0;
-    const wz0 = buildRelative ? z0 + centerZ : z0;
-    const wx1 = buildRelative ? x1 + centerX : x1;
-    const wz1 = buildRelative ? z1 + centerZ : z1;
-    const d00 = Math.hypot(wx0 - centerX, wz0 - centerZ);
-    const d10 = Math.hypot(wx1 - centerX, wz0 - centerZ);
-    const d01 = Math.hypot(wx0 - centerX, wz1 - centerZ);
-    const d11 = Math.hypot(wx1 - centerX, wz1 - centerZ);
-    return { min: Math.min(d00, d10, d01, d11), max: Math.max(d00, d10, d01, d11) };
-  };
-
   const innerMin = inset;
   const innerMax = worldSize - inset;
+  const dist = (x: number, z: number) => {
+    const wx = buildRelative ? x + centerX : x;
+    const wz = buildRelative ? z + centerZ : z;
+    return Math.hypot(wx - centerX, wz - centerZ);
+  };
+
   for (let gz = 0; gz < gridRes; gz++) {
     for (let gx = 0; gx < gridRes; gx++) {
       const x0 = originX + gx * cellSize;
       const x1 = x0 + cellSize;
       const z0 = originZ + gz * cellSize;
       const z1 = z0 + cellSize;
-      if (useRadialExclusion) {
-        const bounds = quadRadiusBounds(x0, z0, x1, z1);
-        if (bounds.max <= innerExclusionRadius || bounds.min >= farRadius) continue;
-      } else {
-        const fullyInside = x0 >= innerMin && x1 <= innerMax && z0 >= innerMin && z1 <= innerMax;
-        if (fullyInside) continue;
-      }
+
       const a = gz * (gridRes + 1) + gx;
       const b = a + 1;
       const c = a + (gridRes + 1);
       const d = c + 1;
-      indices.push(a, c, b, b, c, d);
+
+      if (useRadialExclusion) {
+        const dA = dist(x0, z0);
+        const dB = dist(x1, z0);
+        const dC = dist(x0, z1);
+        const dD = dist(x1, z1);
+
+        // Triangle 1: a, c, b
+        const t1Inside = dA <= innerExclusionRadius && dC <= innerExclusionRadius && dB <= innerExclusionRadius;
+        const t1Outside = dA >= farRadius && dC >= farRadius && dB >= farRadius;
+        if (!t1Inside && !t1Outside) {
+          indices.push(a, c, b);
+        }
+
+        // Triangle 2: b, c, d
+        const t2Inside = dB <= innerExclusionRadius && dC <= innerExclusionRadius && dD <= innerExclusionRadius;
+        const t2Outside = dB >= farRadius && dC >= farRadius && dD >= farRadius;
+        if (!t2Inside && !t2Outside) {
+          indices.push(b, c, d);
+        }
+      } else {
+        const fullyInside = x0 >= innerMin && x1 <= innerMax && z0 >= innerMin && z1 <= innerMax;
+        if (!fullyInside) {
+          indices.push(a, c, b, b, c, d);
+        }
+      }
     }
   }
 

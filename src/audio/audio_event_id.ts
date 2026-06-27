@@ -33,6 +33,9 @@ export const ALL_AUDIO_EVENTS = [
   "terrain.lower",
   "terrain.smooth",
   "terrain.brush.radius",
+  // Spells
+  "spell.fire.cast",
+  "spell.water.cast",
   // CLOD/debug
   "clod.rebuild.start",
   "clod.rebuild.done",

@@ -1,15 +1,27 @@
-import { describe, expect, it, vi, beforeAll, beforeEach } from "vitest";
+import { describe, expect, it, vi, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
 import { ClodWorkerClient } from "./clod_worker_client.js";
+import type { ClodPageNode, PageMesh } from "./types.js";
 
 class MockWorker {
   onmessage: ((event: MessageEvent) => void) | null = null;
   onerror: ((event: ErrorEvent) => void) | null = null;
   postMessage = vi.fn();
   terminate = vi.fn();
+  addEventListener = vi.fn();
+  removeEventListener = vi.fn();
 }
 
+const workerGlobal = globalThis as unknown as Record<string, unknown>;
+const hadOriginalWorker = "Worker" in workerGlobal;
+const originalWorker = workerGlobal.Worker;
+
 beforeAll(() => {
-  (globalThis as unknown as Record<string, unknown>).Worker = MockWorker as unknown as typeof Worker;
+  workerGlobal.Worker = MockWorker as unknown as typeof Worker;
+});
+
+afterAll(() => {
+  if (hadOriginalWorker) workerGlobal.Worker = originalWorker;
+  else delete workerGlobal.Worker;
 });
 
 describe("ClodWorkerClient parent error lifecycle", () => {
@@ -21,6 +33,10 @@ describe("ClodWorkerClient parent error lifecycle", () => {
     onError = vi.fn();
     client = new ClodWorkerClient();
     client.onError = onError as (error: Error) => void;
+  });
+
+  afterEach(() => {
+    client.dispose();
   });
 
   it("starts healthy", () => {
@@ -125,7 +141,112 @@ describe("ClodWorkerClient parent error lifecycle", () => {
     resolveDig(mockWorker, requestId(thirdCall), 1);
     await expect(queued[8]).resolves.toMatchObject({ requestCount: 1 });
   });
+
+  it("rejects sent and unsent dig work when disposed", async () => {
+    const mockWorker = (client as unknown as { worker: MockWorker }).worker;
+    const first = client.rebuildAfterDig(
+      { x: 0, y: 0, z: 0, r: 1 },
+      { minX: 0, maxX: 1, minZ: 0, maxZ: 1 },
+    );
+    expect(digCalls(mockWorker)).toHaveLength(1);
+
+    const queued = client.rebuildAfterDig(
+      { x: 2, y: 0, z: 0, r: 1 },
+      { minX: 2, maxX: 3, minZ: 0, maxZ: 1 },
+    );
+
+    client.dispose();
+
+    await expect(first).rejects.toThrow("disposed");
+    await expect(queued).rejects.toThrow("disposed");
+    expect(mockWorker.terminate).toHaveBeenCalled();
+  });
+
+  it("rejects new dig work after disposal", async () => {
+    client.dispose();
+    await expect(client.rebuildAfterDig(
+      { x: 0, y: 0, z: 0, r: 1 },
+      { minX: 0, maxX: 1, minZ: 0, maxZ: 1 },
+    )).rejects.toThrow("stopped");
+  });
+
+  it("ignores queued worker failures after disposal", () => {
+    const mockWorker = (client as unknown as { worker: MockWorker }).worker;
+    client.dispose();
+
+    mockWorker.onerror!({ message: "late worker failure" } as ErrorEvent);
+    mockWorker.onmessage!({ data: { type: "error", requestId: null, message: "late parent failure" } } as MessageEvent);
+
+    expect(onError).not.toHaveBeenCalled();
+    expect(mockWorker.terminate).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails closed without mutating a parent when a parent batch has an unknown child", () => {
+    const mockWorker = (client as unknown as { worker: MockWorker }).worker;
+    const child = node("L0:0,0", 0);
+    const parent = node("L1:0,0", 1, [child]);
+    const previousChildren = parent.children;
+    const previousMesh = parent.mesh;
+    (client as unknown as { nodesById: Map<string, ClodPageNode> }).nodesById = new Map([
+      [child.id, child],
+      [parent.id, parent],
+    ]);
+
+    mockWorker.onmessage!({
+      data: {
+        type: "parentRebuilt",
+        requestId: 7,
+        changed: [serializedNode("L1:0,0", 1, ["L0:missing"])],
+        parentNodes: 1,
+        parentMs: 0,
+        pendingParents: 0,
+      },
+    } as MessageEvent);
+
+    expect(mockWorker.terminate).toHaveBeenCalled();
+    expect(onError).toHaveBeenCalled();
+    expect(client.isParentsHealthy()).toBe(false);
+    expect(parent.children).toBe(previousChildren);
+    expect(parent.mesh).toBe(previousMesh);
+  });
 });
+
+function mesh(): PageMesh {
+  return {
+    positions: new Float32Array([0, 0, 0, 1, 0, 0, 0, 0, 1]),
+    normals: new Float32Array([0, 1, 0, 0, 1, 0, 0, 1, 0]),
+    paintSlots: new Float32Array([0, 0, 0]),
+    materialWeights: new Float32Array(12),
+    materialWeightStride: 4,
+    indices: new Uint32Array([0, 1, 2]),
+  };
+}
+
+function node(id: string, level: number, children: ClodPageNode[] = []): ClodPageNode {
+  return {
+    id,
+    level,
+    children,
+    mesh: mesh(),
+    footprint: { minX: 0, minZ: 0, maxX: 1, maxZ: 1 },
+    bounds: { center: [0.5, 0, 0.5], radius: 1, minY: 0, maxY: 0 },
+    errorWorld: level,
+    lowBenefit: false,
+  };
+}
+
+function serializedNode(id: string, level: number, childIds: (string | null)[] = []) {
+  return {
+    id,
+    level,
+    childIds,
+    mesh: mesh(),
+    footprint: { minX: 0, minZ: 0, maxX: 1, maxZ: 1 },
+    bounds: { center: [0.5, 0, 0.5], radius: 1, minY: 0, maxY: 0 },
+    errorWorld: level,
+    lowBenefit: false,
+  };
+}
 
 function digCalls(worker: MockWorker): Array<Record<string, unknown>> {
   return worker.postMessage.mock.calls

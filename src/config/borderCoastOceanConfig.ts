@@ -88,6 +88,9 @@ export interface SurfConfig {
 }
 
 export interface DeepOceanWaveConfig {
+  gravity: number;
+  grid_k: number;
+  active_gpu_waves: number;
   wind_speed: number;
   wind_direction_deg: number;
   height_scale: number;
@@ -97,6 +100,7 @@ export interface DeepOceanWaveConfig {
   foam_threshold: number;
   foam_power: number;
   foam_intensity: number;
+  swell_height_scale: number;
 }
 
 export interface DeepOceanShadingConfig {
@@ -126,6 +130,13 @@ export interface DeepOceanConfig {
   shading: DeepOceanShadingConfig;
 }
 
+export interface BorderOceanGameplayConfig {
+  soft_pushback_enabled: boolean;
+  world_edge_margin_m: number;
+  pushback_start_inside_world_m: number;
+  pushback_strength: number;
+}
+
 export interface BorderCoastOceanDebugConfig {
   show_world_bounds: boolean;
   show_coast_band: boolean;
@@ -140,6 +151,7 @@ export interface BorderCoastOceanConfig {
   materials: CoastMaterialsConfig;
   surf: SurfConfig;
   deep_ocean: DeepOceanConfig;
+  gameplay: BorderOceanGameplayConfig;
   debug: BorderCoastOceanDebugConfig;
 }
 
@@ -242,6 +254,23 @@ function normalizeTypeWeights(raw: Record<string, unknown>): CoastTypeWeightsCon
   };
 }
 
+function validateGameplayRelationships(config: BorderOceanGameplayConfig): void {
+  if (config.world_edge_margin_m <= 0) {
+    throw new Error(`${CONFIG_NAME}: gameplay.world_edge_margin_m must be greater than 0`);
+  }
+  if (!config.soft_pushback_enabled) return;
+  if (config.pushback_start_inside_world_m <= 0) {
+    throw new Error(
+      `${CONFIG_NAME}: gameplay.pushback_start_inside_world_m must be greater than 0 when soft pushback is enabled`,
+    );
+  }
+  if (config.pushback_strength <= 0) {
+    throw new Error(
+      `${CONFIG_NAME}: gameplay.pushback_strength must be greater than 0 when soft pushback is enabled`,
+    );
+  }
+}
+
 export function parseBorderCoastOceanConfig(text: string): BorderCoastOceanConfig {
   let parsed: unknown;
   try {
@@ -266,6 +295,7 @@ export function parseBorderCoastOceanConfig(text: string): BorderCoastOceanConfi
   const deepOcean = recordAt(root["deep_ocean"], "deep_ocean");
   const wave = recordAt(deepOcean["wave"], "deep_ocean.wave");
   const shading = recordAt(deepOcean["shading"], "deep_ocean.shading");
+  const gameplay = recordAt(root["gameplay"], "gameplay");
   const debug = recordAt(root["debug"], "debug");
 
   const minX = numberAt(bounds, "min_x", "world.bounds");
@@ -308,6 +338,14 @@ export function parseBorderCoastOceanConfig(text: string): BorderCoastOceanConfi
   if (fogNear >= fogFar) {
     throw new Error(`${CONFIG_NAME}: deep_ocean.shading.fog_near_m must be less than fog_far_m`);
   }
+
+  const gameplayConfig: BorderOceanGameplayConfig = {
+    soft_pushback_enabled: booleanAt(gameplay, "soft_pushback_enabled", "gameplay"),
+    world_edge_margin_m: numberAt(gameplay, "world_edge_margin_m", "gameplay", 0),
+    pushback_start_inside_world_m: numberAt(gameplay, "pushback_start_inside_world_m", "gameplay", 0),
+    pushback_strength: numberAt(gameplay, "pushback_strength", "gameplay", 0),
+  };
+  validateGameplayRelationships(gameplayConfig);
 
   return {
     world: {
@@ -378,6 +416,9 @@ export function parseBorderCoastOceanConfig(text: string): BorderCoastOceanConfi
       near_subdivisions: integerAt(deepOcean, "near_subdivisions", "deep_ocean", 1),
       far_subdivisions: integerAt(deepOcean, "far_subdivisions", "deep_ocean", 1),
       wave: {
+        gravity: numberAt(wave, "gravity", "deep_ocean.wave", Number.MIN_VALUE),
+        grid_k: integerAt(wave, "grid_k", "deep_ocean.wave", 2),
+        active_gpu_waves: integerAt(wave, "active_gpu_waves", "deep_ocean.wave", 1),
         wind_speed: numberAt(wave, "wind_speed", "deep_ocean.wave", 0),
         wind_direction_deg: numberAt(wave, "wind_direction_deg", "deep_ocean.wave"),
         height_scale: numberAt(wave, "height_scale", "deep_ocean.wave", 0),
@@ -387,6 +428,7 @@ export function parseBorderCoastOceanConfig(text: string): BorderCoastOceanConfi
         foam_threshold: numberAt(wave, "foam_threshold", "deep_ocean.wave", 0, 1),
         foam_power: numberAt(wave, "foam_power", "deep_ocean.wave", 0),
         foam_intensity: numberAt(wave, "foam_intensity", "deep_ocean.wave", 0),
+        swell_height_scale: numberAt(wave, "swell_height_scale", "deep_ocean.wave", 0),
       },
       shading: {
         deep_color: colorAt(shading, "deep_color", "deep_ocean.shading"),
@@ -403,6 +445,7 @@ export function parseBorderCoastOceanConfig(text: string): BorderCoastOceanConfi
         fog_density: numberAt(shading, "fog_density", "deep_ocean.shading", 0),
       },
     },
+    gameplay: gameplayConfig,
     debug: {
       show_world_bounds: booleanAt(debug, "show_world_bounds", "debug"),
       show_coast_band: booleanAt(debug, "show_coast_band", "debug"),

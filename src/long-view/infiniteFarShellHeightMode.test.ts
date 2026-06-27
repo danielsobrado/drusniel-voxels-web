@@ -82,6 +82,14 @@ describe("InfiniteFarShell height sampling mode", () => {
     shell.dispose();
   });
 
+  it("fails loudly when GPU mode is requested without an atlas", () => {
+    expect(() => makeShell({
+      useParityMaterial: true,
+      parityConfig,
+      heightSamplingMode: "gpu",
+    })).toThrow(/GPU mode requires parity material, parity config, and a GPU far-summary atlas/);
+  });
+
   it("attaches initial vertex colors for parity material before provider rebuild", () => {
     const shell = makeShell({ useParityMaterial: true, parityConfig });
     const color = shell.mesh.geometry.getAttribute("color") as THREE.BufferAttribute | undefined;

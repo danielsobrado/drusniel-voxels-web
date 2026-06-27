@@ -89,16 +89,25 @@ function parseContainer(bytes: ArrayBuffer): Map<number, ArrayBuffer> {
     if (magic[i] !== MAGIC_BYTES[i]) throw new CacheCorruptError("invalid cache payload magic");
   }
   const sectionCount = readU32(view, 4);
+  const headerSize = 8 + sectionCount * 12;
+  if (headerSize > bytes.byteLength) throw new CacheCorruptError("section table exceeds payload bounds");
   const sections = new Map<number, ArrayBuffer>();
+  const ranges: Array<{ start: number; end: number; type: number }> = [];
   for (let i = 0; i < sectionCount; i++) {
     const base = 8 + i * 12;
-    if (base + 12 > bytes.byteLength) throw new CacheCorruptError("truncated section header");
     const type = readU32(view, base);
     const length = readU32(view, base + 4);
     const offset = readU32(view, base + 8);
+    if (sections.has(type)) throw new CacheCorruptError(`duplicate section ${type}`);
+    if (offset < headerSize) throw new CacheCorruptError(`section ${type} overlaps header`);
     if (offset + length > bytes.byteLength) {
       throw new CacheCorruptError(`section ${type} exceeds payload bounds`);
     }
+    for (const range of ranges) {
+      const overlaps = offset < range.end && offset + length > range.start;
+      if (overlaps) throw new CacheCorruptError(`section ${type} overlaps section ${range.type}`);
+    }
+    ranges.push({ start: offset, end: offset + length, type });
     sections.set(type, bytes.slice(offset, offset + length));
   }
   return sections;
@@ -138,7 +147,50 @@ function readJsonSection<T>(sections: Map<number, ArrayBuffer>, type: number, la
   return JSON.parse(text) as T;
 }
 
+function validateNodeArtifact(artifact: ClodPageNodeArtifact): void {
+  if (artifact.positions.length % 3 !== 0) {
+    throw new CacheDecodeError("node positions length must be divisible by 3");
+  }
+  const vertexCount = artifact.positions.length / 3;
+  if (artifact.normals.length !== artifact.positions.length) {
+    throw new CacheDecodeError("node normals length must match positions length");
+  }
+  if (artifact.paintSlots.length !== vertexCount) {
+    throw new CacheDecodeError("node paintSlots length must match vertex count");
+  }
+  if (!Number.isInteger(artifact.materialWeightStride) || artifact.materialWeightStride <= 0) {
+    throw new CacheDecodeError("node materialWeightStride must be a positive integer");
+  }
+  if (artifact.materialWeights.length !== vertexCount * artifact.materialWeightStride) {
+    throw new CacheDecodeError("node materialWeights length must match vertex count and stride");
+  }
+  if (artifact.indices.length % 3 !== 0) {
+    throw new CacheDecodeError("node indices length must be divisible by 3");
+  }
+}
+
+function validateSummaryArtifact(artifact: TerrainSummaryArtifact): void {
+  if (!Number.isInteger(artifact.res) || artifact.res <= 0) {
+    throw new CacheDecodeError("summary res must be a positive integer");
+  }
+  const expected = artifact.res * artifact.res;
+  const channels: Array<[string, Float32Array]> = [
+    ["heightMin", artifact.heightMin],
+    ["heightMax", artifact.heightMax],
+    ["normalX", artifact.normalX],
+    ["normalY", artifact.normalY],
+    ["normalZ", artifact.normalZ],
+    ["coverage", artifact.coverage],
+  ];
+  for (const [label, channel] of channels) {
+    if (channel.length !== expected) {
+      throw new CacheDecodeError(`summary ${label} length must equal res*res`);
+    }
+  }
+}
+
 export function encodeClodPageNodeArtifact(artifact: ClodPageNodeArtifact): ArrayBuffer {
+  validateNodeArtifact(artifact);
   const metadata = {
     nodeId: artifact.nodeId,
     level: artifact.level,
@@ -172,7 +224,7 @@ export function decodeClodPageNodeArtifact(bytes: ArrayBuffer): ClodPageNodeArti
     bounds: ClodPageNodeArtifact["bounds"];
   }>(sections, CACHE_SECTION.NODE_METADATA_JSON, "node metadata");
 
-  return {
+  const artifact: ClodPageNodeArtifact = {
     nodeId: meta.nodeId,
     level: meta.level,
     positions: readF32Section(sections, CACHE_SECTION.POSITIONS_F32, "positions"),
@@ -187,6 +239,8 @@ export function decodeClodPageNodeArtifact(bytes: ArrayBuffer): ClodPageNodeArti
     footprint: meta.footprint,
     bounds: meta.bounds,
   };
+  validateNodeArtifact(artifact);
+  return artifact;
 }
 
 export function encodeClodPageTreeArtifact(artifact: ClodPageTreeArtifact): ArrayBuffer {
@@ -199,6 +253,7 @@ export function decodeClodPageTreeArtifact(bytes: ArrayBuffer): ClodPageTreeArti
 }
 
 export function encodeTerrainSummaryArtifact(artifact: TerrainSummaryArtifact): ArrayBuffer {
+  validateSummaryArtifact(artifact);
   const f32Data = concatSummaryF32(artifact);
   const metadata = {
     res: artifact.res,
@@ -219,6 +274,13 @@ export function encodeTerrainSummaryArtifact(artifact: TerrainSummaryArtifact): 
   ]);
 }
 
+function checkedChannelLength(value: unknown, label: string): number {
+  if (!Number.isInteger(value) || (value as number) < 0) {
+    throw new CacheDecodeError(`invalid summary channel length for ${label}`);
+  }
+  return value as number;
+}
+
 export function decodeTerrainSummaryArtifact(bytes: ArrayBuffer): TerrainSummaryArtifact {
   const sections = parseContainer(bytes);
   const meta = readJsonSection<{
@@ -229,25 +291,41 @@ export function decodeTerrainSummaryArtifact(bytes: ArrayBuffer): TerrainSummary
   }>(sections, CACHE_SECTION.NODE_METADATA_JSON, "summary metadata");
   const f32Buf = sections.get(CACHE_SECTION.SUMMARY_F32);
   if (!f32Buf) throw new CacheDecodeError("missing summary f32 section");
+  if (f32Buf.byteLength % 4 !== 0) throw new CacheDecodeError("invalid summary f32 section length");
   const all = new Float32Array(f32Buf);
+  const cl = meta.channelLengths;
+  const lengths = {
+    heightMin: checkedChannelLength(cl.heightMin, "heightMin"),
+    heightMax: checkedChannelLength(cl.heightMax, "heightMax"),
+    normalX: checkedChannelLength(cl.normalX, "normalX"),
+    normalY: checkedChannelLength(cl.normalY, "normalY"),
+    normalZ: checkedChannelLength(cl.normalZ, "normalZ"),
+    coverage: checkedChannelLength(cl.coverage, "coverage"),
+  };
+  const expected = lengths.heightMin + lengths.heightMax + lengths.normalX + lengths.normalY + lengths.normalZ + lengths.coverage;
+  if (expected !== all.length) {
+    throw new CacheDecodeError(`summary channel length mismatch: expected ${expected}, got ${all.length}`);
+  }
+
   let offset = 0;
   const take = (len: number) => {
     const slice = all.slice(offset, offset + len);
     offset += len;
     return slice;
   };
-  const cl = meta.channelLengths;
-  return {
+  const artifact = {
     res: meta.res,
     worldSize: meta.worldSize,
     farReduceFactor: meta.farReduceFactor,
-    heightMin: take(cl.heightMin!),
-    heightMax: take(cl.heightMax!),
-    normalX: take(cl.normalX!),
-    normalY: take(cl.normalY!),
-    normalZ: take(cl.normalZ!),
-    coverage: take(cl.coverage!),
+    heightMin: take(lengths.heightMin),
+    heightMax: take(lengths.heightMax),
+    normalX: take(lengths.normalX),
+    normalY: take(lengths.normalY),
+    normalZ: take(lengths.normalZ),
+    coverage: take(lengths.coverage),
   };
+  validateSummaryArtifact(artifact);
+  return artifact;
 }
 
 function concatSummaryF32(artifact: TerrainSummaryArtifact): ArrayBuffer {

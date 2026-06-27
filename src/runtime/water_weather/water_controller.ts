@@ -62,10 +62,10 @@ export interface WaterController {
   setDebugMode(mode: keyof typeof WATER_DEBUG_MODES): void;
   setClipmapTint(enabled: boolean): void;
   setWireframe(enabled: boolean): void;
-  setOceanEnabled(enabled: boolean): void;
-  setOceanStartDistance(distance: number): void;
-  setOceanFullDepthDistance(distance: number): void;
-  setOceanMaxDepth(depth: number): void;
+  setShoreSurfEnabled(enabled: boolean): void;
+  setShoreSurfStartDistance(distance: number): void;
+  setShoreSurfFullDistance(distance: number): void;
+  setShoreSurfMaxDepth(depth: number): void;
   updateVisual(visual: ReturnType<WaterController["makeVisual"]>): void;
   updateSunDirection(direction: THREE.Vector3): void;
   update(deltaSeconds: number, cameraPosition: THREE.Vector3): void;
@@ -81,11 +81,18 @@ function readPositiveParam(searchParams: URLSearchParams, key: string, fallback:
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function readNonNegativeParam(searchParams: URLSearchParams, key: string, fallback: number): number {
+  const raw = searchParams.get(key);
+  if (raw === null) return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
 function readShoreSurfSettings(
   searchParams: URLSearchParams,
   borderCoast?: BorderCoastOceanConfig,
 ): ShoreSurfBandSettings {
-  const fromBorder = borderCoast?.enabled
+  const fromBorder: Partial<ShoreSurfBandSettings> = borderCoast?.enabled
     ? {
         enabled: true,
         startDistance: borderCoast.coast.oceanStartCells,
@@ -94,8 +101,8 @@ function readShoreSurfSettings(
         maxShallowDepth: Math.min(2.5, borderCoast.ocean.minDepth),
       }
     : {};
-  const urlEnabled = searchParams.get("shoreSurf") === "1" || searchParams.get("edgeOcean") === "1";
-  const urlDisabled = searchParams.get("shoreSurf") === "0" || searchParams.get("edgeOcean") === "0";
+  const urlEnabled = searchParams.get("shoreSurf") === "1";
+  const urlDisabled = searchParams.get("shoreSurf") === "0";
   const surfEnabled = Boolean(fromBorder.enabled);
   return {
     ...DEFAULT_SHORE_SURF_BAND_SETTINGS,
@@ -103,17 +110,17 @@ function readShoreSurfSettings(
     enabled: !urlDisabled && (urlEnabled || surfEnabled),
     startDistance: readPositiveParam(
       searchParams,
-      "oceanStart",
+      "shoreSurfStart",
       fromBorder.startDistance ?? DEFAULT_SHORE_SURF_BAND_SETTINGS.startDistance,
     ),
-    fullSurfDistance: readPositiveParam(
+    fullSurfDistance: readNonNegativeParam(
       searchParams,
-      "oceanFull",
+      "shoreSurfFull",
       fromBorder.fullSurfDistance ?? DEFAULT_SHORE_SURF_BAND_SETTINGS.fullSurfDistance,
     ),
     maxShallowDepth: readPositiveParam(
       searchParams,
-      "surfDepth",
+      "shoreSurfDepth",
       fromBorder.maxShallowDepth ?? DEFAULT_SHORE_SURF_BAND_SETTINGS.maxShallowDepth,
     ),
   };
@@ -169,10 +176,10 @@ export async function createWaterController(deps: WaterControllerDeps): Promise<
     clipmapTint: ui.waterClipmapTint,
     wireframe: ui.waterWireframe,
     depthWrite: ui.waterDepthWrite,
-    oceanEnabled: shoreSurfSettings.enabled,
-    oceanStartDistance: shoreSurfSettings.startDistance,
-    oceanFullDepthDistance: shoreSurfSettings.fullSurfDistance,
-    oceanMaxDepth: shoreSurfSettings.maxShallowDepth,
+    shoreSurfEnabled: shoreSurfSettings.enabled,
+    shoreSurfStartDistance: shoreSurfSettings.startDistance,
+    shoreSurfFullDistance: shoreSurfSettings.fullSurfDistance,
+    shoreSurfMaxDepth: shoreSurfSettings.maxShallowDepth,
     riverSource: deps.waterConfig.source,
   };
 
@@ -183,10 +190,10 @@ export async function createWaterController(deps: WaterControllerDeps): Promise<
 
   const applyShoreSurfDebugState = () => {
     field.setShoreSurfBand({
-      enabled: debugState.oceanEnabled,
-      startDistance: debugState.oceanStartDistance,
-      fullSurfDistance: debugState.oceanFullDepthDistance,
-      maxShallowDepth: debugState.oceanMaxDepth,
+      enabled: debugState.shoreSurfEnabled,
+      startDistance: debugState.shoreSurfStartDistance,
+      fullSurfDistance: debugState.shoreSurfFullDistance,
+      maxShallowDepth: debugState.shoreSurfMaxDepth,
     });
     clipmap.update(0, deps.camera.position as THREE.Vector3);
   };
@@ -209,20 +216,20 @@ export async function createWaterController(deps: WaterControllerDeps): Promise<
     setWireframe(enabled) {
       clipmap.setWireframe(enabled);
     },
-    setOceanEnabled(enabled) {
-      debugState.oceanEnabled = enabled;
+    setShoreSurfEnabled(enabled) {
+      debugState.shoreSurfEnabled = enabled;
       applyShoreSurfDebugState();
     },
-    setOceanStartDistance(distance) {
-      debugState.oceanStartDistance = Math.max(1, distance);
+    setShoreSurfStartDistance(distance) {
+      debugState.shoreSurfStartDistance = Math.max(1, distance);
       applyShoreSurfDebugState();
     },
-    setOceanFullDepthDistance(distance) {
-      debugState.oceanFullDepthDistance = Math.max(0, distance);
+    setShoreSurfFullDistance(distance) {
+      debugState.shoreSurfFullDistance = Math.max(0, distance);
       applyShoreSurfDebugState();
     },
-    setOceanMaxDepth(depth) {
-      debugState.oceanMaxDepth = Math.max(0.01, depth);
+    setShoreSurfMaxDepth(depth) {
+      debugState.shoreSurfMaxDepth = Math.max(0.01, depth);
       applyShoreSurfDebugState();
     },
     updateVisual(visual) {
@@ -265,10 +272,10 @@ export async function createWaterController(deps: WaterControllerDeps): Promise<
         return { mode: modeName, id };
       };
       const setShoreSurfBand = (settings: Partial<ShoreSurfBandSettings & { fullDepthDistance?: number; maxDepth?: number }>) => {
-        debugState.oceanEnabled = settings.enabled ?? debugState.oceanEnabled;
-        debugState.oceanStartDistance = settings.startDistance ?? debugState.oceanStartDistance;
-        debugState.oceanFullDepthDistance = settings.fullSurfDistance ?? settings.fullDepthDistance ?? debugState.oceanFullDepthDistance;
-        debugState.oceanMaxDepth = settings.maxShallowDepth ?? settings.maxDepth ?? debugState.oceanMaxDepth;
+        debugState.shoreSurfEnabled = settings.enabled ?? debugState.shoreSurfEnabled;
+        debugState.shoreSurfStartDistance = settings.startDistance ?? debugState.shoreSurfStartDistance;
+        debugState.shoreSurfFullDistance = settings.fullSurfDistance ?? settings.fullDepthDistance ?? debugState.shoreSurfFullDistance;
+        debugState.shoreSurfMaxDepth = settings.maxShallowDepth ?? settings.maxDepth ?? debugState.shoreSurfMaxDepth;
         applyShoreSurfDebugState();
         return field.getShoreSurfBand();
       };
@@ -339,7 +346,6 @@ export async function createWaterController(deps: WaterControllerDeps): Promise<
         waterProbe: sampleForDebug,
         setWaterDebugMode,
         setShoreSurfBand,
-        setEdgeOcean: setShoreSurfBand,
         setCameraPose,
         waterDebugInfo,
       });

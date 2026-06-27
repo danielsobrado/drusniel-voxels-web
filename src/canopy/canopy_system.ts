@@ -58,8 +58,66 @@ export function shouldRebuildCanopyShell(
 
 /** Conservative shell grid cap from triangle budget (assumes all quads are emitted). */
 export function shellGridForTriangleBudget(maxShellTris: number, preferredGrid = 192): number {
-  const maxGrid = Math.floor(Math.sqrt(maxShellTris / 2));
-  return Math.max(16, Math.min(preferredGrid, maxGrid));
+  const safeTriangleBudget = Number.isFinite(maxShellTris) && maxShellTris > 0 ? maxShellTris : 512;
+  const safePreferredGrid = Number.isFinite(preferredGrid) && preferredGrid > 0 ? preferredGrid : 192;
+  const maxGrid = Math.floor(Math.sqrt(safeTriangleBudget / 2));
+  return Math.max(16, Math.min(safePreferredGrid, maxGrid));
+}
+
+export function treeDistributionConfigKey(config: CanopyShellConfig): string {
+  return JSON.stringify({
+    seed: config.seed,
+    treeDistribution: config.treeDistribution,
+  });
+}
+
+export function canopyTextureConfigKey(config: CanopyShellConfig): string {
+  return JSON.stringify({
+    source: {
+      allowSyntheticDebugFallback: config.source.allowSyntheticDebugFallback,
+    },
+    distances: config.distances,
+    clipmap: config.clipmap,
+    material: config.material,
+    debug: {
+      showCoverageHeatmap: config.debug.showCoverageHeatmap,
+      forceSyntheticSource: config.debug.forceSyntheticSource,
+    },
+    budgets: {
+      maxShellTris: config.budgets.maxShellTris,
+    },
+  });
+}
+
+export function shellCenterForTextureSet(set: CanopyTextureSet): { x: number; z: number } {
+  return {
+    x: set.originX + set.extentM * 0.5,
+    z: set.originZ + set.extentM * 0.5,
+  };
+}
+
+export function shouldAttemptTextureUpload(
+  maxTextureUploadsPerFrame: number,
+  uploadsUsedThisFrame: number,
+): boolean {
+  return maxTextureUploadsPerFrame > uploadsUsedThisFrame;
+}
+
+export function shouldUseSyntheticCanopyFallback(
+  config: CanopyShellConfig,
+  forceSynthetic: boolean,
+  visibleTileCount: number,
+): boolean {
+  if (forceSynthetic || config.debug.forceSyntheticSource) return true;
+  if (!config.clipmap.enabled) return false;
+  return visibleTileCount === 0 && config.source.allowSyntheticDebugFallback;
+}
+
+export function shouldKeepCanopyShellActive(
+  config: CanopyShellConfig,
+  forceSynthetic: boolean,
+): boolean {
+  return config.clipmap.enabled || forceSynthetic || config.debug.forceSyntheticSource;
 }
 
 export function createCanopyShellSystem(
@@ -75,10 +133,8 @@ export function createCanopyShellSystem(
 
   const clipmap = createCanopyClipmap();
   let treeDistribution = createTreeDistribution(config.treeDistribution, config.seed);
-  let treeDistributionKey = JSON.stringify({
-    seed: config.seed,
-    treeDistribution: config.treeDistribution,
-  });
+  let treeDistributionKey = treeDistributionConfigKey(config);
+  let textureConfigKey = canopyTextureConfigKey(config);
   let terrainSampler: CanopyTerrainSampler = createBlendedTerrainSampler(
     deps.terrainSummary,
     config.distances.shellEndM,
@@ -91,6 +147,7 @@ export function createCanopyShellSystem(
   let textureSet: CanopyTextureSet | null = null;
   let metrics = createEmptyCanopyMetrics();
   let uploadBudgetUsed = 0;
+  let textureRefreshPending = false;
   let centerX = deps.worldSizeCells / 2;
   let centerZ = deps.worldSizeCells / 2;
 
@@ -100,6 +157,24 @@ export function createCanopyShellSystem(
     const counters = canopyMetricsToCounters(metrics, true);
     deps.onCounters?.(counters);
     debugState.statsLine = formatCanopyStatsLine(metrics, debugState.syntheticFallbackActive);
+  };
+
+  const positionShellAtTextureCenter = () => {
+    if (!shell || !textureSet) return;
+    const center = shellCenterForTextureSet(textureSet);
+    shell.mesh.position.set(center.x, 0, center.z);
+  };
+
+  const disposeShellAndTextures = () => {
+    if (shell) {
+      deps.scene.remove(shell.mesh);
+      shell.dispose();
+      shell = null;
+    }
+    disposeCanopyTextureSet(textureSet);
+    textureSet = null;
+    metrics.shellTriangles = 0;
+    debugState.syntheticFallbackActive = false;
   };
 
   const rebuildShell = (set: CanopyTextureSet) => {
@@ -120,20 +195,25 @@ export function createCanopyShellSystem(
       showCoverageHeatmap: debugState.showCoverageHeatmap,
       wireframe: debugState.showShellWireframe,
     });
-    shell.mesh.position.set(centerX, 0, centerZ);
     deps.scene.add(shell.mesh);
     metrics.shellTriangles = shell.triangleCount;
+    positionShellAtTextureCenter();
   };
 
-  const ensureTextures = (forceSynthetic: boolean) => {
+  const ensureTextures = (forceSynthetic: boolean): boolean => {
+    if (!shouldKeepCanopyShellActive(config, forceSynthetic)) {
+      disposeShellAndTextures();
+      textureRefreshPending = false;
+      return false;
+    }
+
+    const visibleTiles = clipmap.getVisibleTiles();
     const farRadius = config.distances.shellEndM;
-    const useSynthetic = forceSynthetic
-      || config.debug.forceSyntheticSource
-      || (clipmap.getVisibleTiles().length === 0 && config.source.allowSyntheticDebugFallback);
+    const useSynthetic = shouldUseSyntheticCanopyFallback(config, forceSynthetic, visibleTiles.length);
 
     const t0 = performance.now();
     const next = buildCanopyTextureSet({
-      visibleTiles: clipmap.getVisibleTiles(),
+      visibleTiles,
       config,
       centerX,
       centerZ,
@@ -150,40 +230,61 @@ export function createCanopyShellSystem(
       disposeCanopyTextureSet(textureSet);
       textureSet = next;
       rebuildShell(next);
+    } else {
+      disposeCanopyTextureSet(next);
     }
+    return true;
   };
 
   const update = (cameraX: number, cameraZ: number) => {
     config = deps.getConfig();
+
     if (config.distances.shellEndM !== terrainSamplerRadius) {
       terrainSamplerRadius = config.distances.shellEndM;
       terrainSampler = createBlendedTerrainSampler(deps.terrainSummary, terrainSamplerRadius);
+      clipmap.disposeFarTiles();
+      textureRefreshPending = true;
     }
-    const nextTreeKey = JSON.stringify({
-      seed: config.seed,
-      treeDistribution: config.treeDistribution,
-    });
+
+    const nextTreeKey = treeDistributionConfigKey(config);
     if (nextTreeKey !== treeDistributionKey) {
       treeDistributionKey = nextTreeKey;
       treeDistribution = createTreeDistribution(config.treeDistribution, config.seed);
       clipmap.disposeFarTiles();
+      textureRefreshPending = true;
     }
+
+    const nextTextureConfigKey = canopyTextureConfigKey(config);
+    if (nextTextureConfigKey !== textureConfigKey) {
+      textureConfigKey = nextTextureConfigKey;
+      textureRefreshPending = true;
+    }
+
     clipmap.setFreezeCenter(config.debug.freezeClipCenter || debugState.freezeClipCenter);
     const clipUpdate = clipmap.update(cameraX, cameraZ, config, terrainSampler, treeDistribution);
     centerX = clipUpdate.centerX;
     centerZ = clipUpdate.centerZ;
     metrics = { ...metrics, ...clipUpdate.metrics };
 
+    if (!shouldKeepCanopyShellActive(config, false)) {
+      disposeShellAndTextures();
+      textureRefreshPending = false;
+      updateCanopyDebugOverlays(overlays, clipmap.getVisibleTiles(), config, centerX, centerZ, debugState);
+      publish();
+      return;
+    }
+
     uploadBudgetUsed = 0;
-    if (clipUpdate.texturesDirty || !textureSet) {
-      if (uploadBudgetUsed < config.budgets.maxTextureUploadsPerFrame) {
-        ensureTextures(false);
+    if (clipUpdate.texturesDirty || textureRefreshPending || !textureSet) {
+      if (shouldAttemptTextureUpload(config.budgets.maxTextureUploadsPerFrame, uploadBudgetUsed)) {
+        const uploaded = ensureTextures(false);
+        if (uploaded) textureRefreshPending = false;
         uploadBudgetUsed++;
       }
     }
 
     if (shell) {
-      shell.mesh.position.set(centerX, 0, centerZ);
+      positionShellAtTextureCenter();
       const mat = shell.mesh.material as THREE.Material & { wireframe?: boolean };
       if ("wireframe" in mat) mat.wireframe = debugState.showShellWireframe;
     }
@@ -201,17 +302,22 @@ export function createCanopyShellSystem(
     update,
     applyDebugConfig() {
       config = deps.getConfig();
-      ensureTextures(config.debug.forceSyntheticSource);
+      textureConfigKey = canopyTextureConfigKey(config);
+      textureRefreshPending = true;
+      if (!shouldKeepCanopyShellActive(config, config.debug.forceSyntheticSource)) {
+        disposeShellAndTextures();
+        textureRefreshPending = false;
+        publish();
+        return;
+      }
+      if (shouldAttemptTextureUpload(config.budgets.maxTextureUploadsPerFrame, 0)) {
+        const uploaded = ensureTextures(config.debug.forceSyntheticSource);
+        if (uploaded) textureRefreshPending = false;
+      }
       publish();
     },
     dispose() {
-      if (shell) {
-        deps.scene.remove(shell.mesh);
-        shell.dispose();
-        shell = null;
-      }
-      disposeCanopyTextureSet(textureSet);
-      textureSet = null;
+      disposeShellAndTextures();
       clipmap.dispose();
       overlays.dispose();
     },

@@ -24,10 +24,10 @@ export interface WaterDebugState {
   clipmapTint: boolean;
   wireframe: boolean;
   depthWrite: boolean;
-  oceanEnabled: boolean;
-  oceanStartDistance: number;
-  oceanFullDepthDistance: number;
-  oceanMaxDepth: number;
+  shoreSurfEnabled: boolean;
+  shoreSurfStartDistance: number;
+  shoreSurfFullDistance: number;
+  shoreSurfMaxDepth: number;
   riverSource: "hydrology" | "fake_bodies";
   riversFallback: boolean;
   riverMain: boolean;
@@ -62,10 +62,10 @@ export interface WaterDebugBindings {
   onClipmapTint: (enabled: boolean) => void;
   onWireframe: (enabled: boolean) => void;
   onDepthWrite: (depthWrite: boolean) => void;
-  onOceanEnabled: (enabled: boolean) => void;
-  onOceanStartDistance: (distance: number) => void;
-  onOceanFullDepthDistance: (distance: number) => void;
-  onOceanMaxDepth: (depth: number) => void;
+  onShoreSurfEnabled: (enabled: boolean) => void;
+  onShoreSurfStartDistance: (distance: number) => void;
+  onShoreSurfFullDistance: (distance: number) => void;
+  onShoreSurfMaxDepth: (depth: number) => void;
   onRebuildVisual: () => void;
   getRiverStats?: () => WaterRiverDebugStats;
 }
@@ -92,9 +92,22 @@ const WATER_DEBUG_LABELS: Record<WaterDebugMode, string> = {
   ssrHit: "SSR hit",
 };
 
+const MATERIAL_DEBUG_MODES = [
+  "final",
+  "depth",
+  "foam",
+  "fresnel",
+  "bodyMask",
+  "clipmapLevel",
+  "flow",
+  "refraction",
+  "reflection",
+  "ssrHit",
+] as const satisfies readonly WaterDebugMode[];
+
 const WATER_MODE_OPTIONS = Object.fromEntries(
-  Object.entries(WATER_DEBUG_MODES).map(([mode, id]) => [
-    `${WATER_DEBUG_LABELS[mode as WaterDebugMode]} (${id})`,
+  MATERIAL_DEBUG_MODES.map((mode) => [
+    `${WATER_DEBUG_LABELS[mode]} (${WATER_DEBUG_MODES[mode]})`,
     mode,
   ]),
 ) as Record<string, WaterDebugMode>;
@@ -195,18 +208,14 @@ function addRiverEcologyDebugFolder(
 ): { refresh: () => void } {
   const folder = parent.addFolder("river ecology debug");
   const actions = {
-    showClassification: () => setWaterDebugMode(state, bindings, "classification"),
-    showCarvedBed: () => setWaterDebugMode(state, bindings, "carvedBed"),
-    showWaterY: () => setWaterDebugMode(state, bindings, "waterY"),
     showFlow: () => setWaterDebugMode(state, bindings, "flow"),
     showFoam: () => setWaterDebugMode(state, bindings, "foam"),
+    showDepth: () => setWaterDebugMode(state, bindings, "depth"),
     showFinal: () => setWaterDebugMode(state, bindings, "final"),
   };
-  folder.add(actions, "showClassification").name("show classification");
-  folder.add(actions, "showCarvedBed").name("show carved bed");
-  folder.add(actions, "showWaterY").name("show water Y");
   folder.add(actions, "showFlow").name("show flow");
   folder.add(actions, "showFoam").name("show foam");
+  folder.add(actions, "showDepth").name("show depth");
   folder.add(actions, "showFinal").name("back to final");
 
   const readout = riverEcologyReadout();
@@ -258,14 +267,16 @@ function addRiverMaterialTuningFolder(parent: GUI): { refresh: () => void } {
   folder.add(settings, "cascadeDropStart", 0, 8, 0.05).name("cascade drop start");
   folder.add(settings, "cascadeDropEnd", 0.05, 16, 0.05).name("cascade drop end");
   folder.add(settings, "cascadeStepStrength", 0, 0.60, 0.005).name("cascade step");
-  folder.add(settings, "cascadeRoughnessStrength", 0, 0.40, 0.005).name("cascade roughness");
+  folder.add(settings, "cascadeRoughnessStrength", 0, 0.40, 0.005).name("cascade rough");
   folder.add(settings, "cascadeWhitewaterBoost", 0, 5, 0.05).name("whitewater boost");
   folder.add(settings, "wetBankStrength", 0, 2, 0.05).name("wet bank decals");
   folder.add(settings, "wetBankDistanceM", 0.5, 24, 0.5).name("wet bank distance");
   folder.add(settings, "wetRockDarkening", 0, 1, 0.02).name("wet rock darken");
   folder.add(settings, "foamResidueStrength", 0, 2, 0.05).name("foam residue");
-  folder.add(settings, "foamResidueDropStart", 0, 8, 0.05).name("residue drop start");
-  folder.add(settings, "flowNormalStrength", 0, 4, 0.05).name("flow normal");
+  folder.add(settings, "foamResidueDropStart", 0, 12, 0.05).name("foam drop start");
+  folder.add(settings, "foamResidueDropEnd", 0.05, 24, 0.05).name("foam drop end");
+  folder.add(settings, "bankNormalStrength", 0, 3, 0.05).name("bank normal");
+  folder.add(settings, "rapidScale", 0.02, 1.0, 0.01).name("rapid scale");
   folder.add(settings, "crossCurrentStrength", 0, 4, 0.05).name("cross current");
   folder.add(settings, "rapidNormalBoost", 0, 4, 0.05).name("rapid normal");
   folder.add(settings, "bankFoamStrength", 0, 3, 0.05).name("bank foam");
@@ -287,10 +298,10 @@ export function defaultWaterDebugState(visual: WaterVisualConfig): WaterDebugSta
     clipmapTint: false,
     wireframe: false,
     depthWrite: visual.depthWrite,
-    oceanEnabled: DEFAULT_SHORE_SURF_BAND_SETTINGS.enabled,
-    oceanStartDistance: DEFAULT_SHORE_SURF_BAND_SETTINGS.startDistance,
-    oceanFullDepthDistance: DEFAULT_SHORE_SURF_BAND_SETTINGS.fullSurfDistance,
-    oceanMaxDepth: DEFAULT_SHORE_SURF_BAND_SETTINGS.maxShallowDepth,
+    shoreSurfEnabled: DEFAULT_SHORE_SURF_BAND_SETTINGS.enabled,
+    shoreSurfStartDistance: DEFAULT_SHORE_SURF_BAND_SETTINGS.startDistance,
+    shoreSurfFullDistance: DEFAULT_SHORE_SURF_BAND_SETTINGS.fullSurfDistance,
+    shoreSurfMaxDepth: DEFAULT_SHORE_SURF_BAND_SETTINGS.maxShallowDepth,
     riverSource: querySource("hydrology"),
     riversFallback: queryBool("riversFallback", riverDefaults.guaranteeFallbackRivers),
     riverMain: queryBool("riverMain", riverDefaults.fallbackMainRiver),
@@ -309,19 +320,13 @@ export function addWaterDebugFolder(
   bindings: WaterDebugBindings,
 ): WaterDebugController {
   const folder = gui.addFolder("water");
-  folder.add(state, "enabled").name("enabled").onChange((enabled: boolean) => {
-    bindings.onEnabled(enabled);
-  });
+  folder.add(state, "enabled").name("enabled").onChange((enabled: boolean) => bindings.onEnabled(enabled));
   folder.add(state, "mode", WATER_MODE_OPTIONS).name("debug mode").onChange((key: string) => {
     const mode = WATER_MODE_OPTIONS[key] ?? (Object.values(WATER_MODE_OPTIONS).includes(key as WaterDebugMode) ? key as WaterDebugMode : undefined);
     if (mode) bindings.onMode(mode);
   });
-  folder.add(state, "clipmapTint").name("clipmap tint").onChange((enabled: boolean) => {
-    bindings.onClipmapTint(enabled);
-  });
-  folder.add(state, "wireframe").name("wireframe").onChange((enabled: boolean) => {
-    bindings.onWireframe(enabled);
-  });
+  folder.add(state, "clipmapTint").name("clipmap tint").onChange((enabled: boolean) => bindings.onClipmapTint(enabled));
+  folder.add(state, "wireframe").name("wireframe").onChange((enabled: boolean) => bindings.onWireframe(enabled));
   folder.add(state, "depthWrite").name("depth write").onChange((on: boolean) => {
     bindings.onDepthWrite(on);
     bindings.onRebuildVisual();
@@ -345,18 +350,10 @@ export function addWaterDebugFolder(
   const riverMaterialTuning = addRiverMaterialTuningFolder(folder);
 
   const shoreSurf = folder.addFolder("shore surf");
-  shoreSurf.add(state, "oceanEnabled").name("enabled").onChange((enabled: boolean) => {
-    bindings.onOceanEnabled(enabled);
-  });
-  shoreSurf.add(state, "oceanStartDistance", 8, 192, 1).name("start distance").onChange((distance: number) => {
-    bindings.onOceanStartDistance(distance);
-  });
-  shoreSurf.add(state, "oceanFullDepthDistance", 0, 128, 1).name("full surf at").onChange((distance: number) => {
-    bindings.onOceanFullDepthDistance(distance);
-  });
-  shoreSurf.add(state, "oceanMaxDepth", 0.1, 8, 0.1).name("max shallow depth").onChange((depth: number) => {
-    bindings.onOceanMaxDepth(depth);
-  });
+  shoreSurf.add(state, "shoreSurfEnabled").name("enabled").onChange((enabled: boolean) => bindings.onShoreSurfEnabled(enabled));
+  shoreSurf.add(state, "shoreSurfStartDistance", 8, 192, 1).name("start distance").onChange((distance: number) => bindings.onShoreSurfStartDistance(distance));
+  shoreSurf.add(state, "shoreSurfFullDistance", 0, 128, 1).name("full surf at").onChange((distance: number) => bindings.onShoreSurfFullDistance(distance));
+  shoreSurf.add(state, "shoreSurfMaxDepth", 0.1, 8, 0.1).name("max shallow depth").onChange((depth: number) => bindings.onShoreSurfMaxDepth(depth));
 
   return {
     refreshDisplay: () => {

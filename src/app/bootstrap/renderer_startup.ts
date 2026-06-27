@@ -9,9 +9,15 @@ import { getRendererGpuDevice } from "../../rendering/webgpu_device_bridge.js";
 import { failLoud } from "../../core/diagnostics.js";
 import { TerrainColliderSet, type TerrainColliderPage } from "../../terrain/terrain_collider.js";
 import {
+  DEFAULT_PLAYER_CONFIG,
   PlayerController,
   PlayerInteractionState,
+  validatePlayerWorldBoundsFit,
 } from "../../player_controller.js";
+import {
+  parseBorderOceanGameplayConfig,
+  resolvePlayerConfigForBorderOcean,
+} from "../../player/border_ocean_player_config.js";
 import { createTerrainRaycastService } from "../../player/terrain_raycast_service.js";
 import { surfaceHeight } from "../../terrain/terrain.js";
 import type { ClodPagesConfig } from "../../config.js";
@@ -21,6 +27,7 @@ import type { WaterConfig } from "../../water/waterConfig.js";
 import type { Phase0SceneConfig } from "../../phase0/phase0_config.js";
 import { RIVER_PARITY_TEST_SCENE } from "../../water/riverParityScene.js";
 import borderOceanSceneConfigText from "../../../config/border_ocean_scene.yaml?raw";
+import borderCoastOceanConfigText from "../../../config/border_coast_ocean.yaml?raw";
 import {
   parseBorderOceanCamString,
   parseBorderOceanSceneConfig,
@@ -74,6 +81,18 @@ export async function runRendererStartup(input: RendererStartupInput): Promise<R
   } = input;
 
   const borderOceanSceneConfig = parseBorderOceanSceneConfig(borderOceanSceneConfigText);
+  const borderOceanGameplayConfig = parseBorderOceanGameplayConfig(borderCoastOceanConfigText);
+  const playerConfig = resolvePlayerConfigForBorderOcean(
+    DEFAULT_PLAYER_CONFIG,
+    borderOceanGameplayConfig,
+  );
+  const playerBounds = {
+    minX: 0,
+    minZ: 0,
+    maxX: worldCells,
+    maxZ: worldCells,
+  };
+  validatePlayerWorldBoundsFit(playerBounds, playerConfig);
 
   const rendererBackend = parseRendererBackend(searchParams);
   let app: AppRenderer;
@@ -199,12 +218,7 @@ export async function runRendererStartup(input: RendererStartupInput): Promise<R
       footprint: node.footprint,
     }));
   const terrainColliders = new TerrainColliderSet(colliderPages);
-  const player = new PlayerController(terrainColliders, {
-    minX: -1000,
-    minZ: -1000,
-    maxX: Math.max(worldCells, 1000),
-    maxZ: Math.max(worldCells, 1000),
-  });
+  const player = new PlayerController(terrainColliders, playerBounds, playerConfig);
   const interaction = new PlayerInteractionState();
   const terrainRaycast = createTerrainRaycastService({
     terrainColliders,

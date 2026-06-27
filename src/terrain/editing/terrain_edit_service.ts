@@ -6,6 +6,7 @@ import {
   addDigEdit,
   DIG_INFLUENCE_MARGIN,
   getDigEditsSnapshot,
+  replaceDigEdits,
   type BrushOp,
   type BrushShape,
   type DigEdit,
@@ -15,6 +16,7 @@ import type { ClodSelectionController } from "../selection/clod_selection_contro
 import type { TerrainRaycastService } from "../../player/terrain_raycast_service.js";
 
 const VEGETATION_REBUILD_DEBOUNCE_MS = 160;
+const VEGETATION_REBUILD_RETRY_MS = 1000;
 
 export interface TerrainBrushParams {
   digRadius: number;
@@ -77,27 +79,55 @@ export function createTerrainEditService(deps: TerrainEditServiceDeps): TerrainE
   const pendingTreeNodeIds = new Set<string>();
   const pendingUnderstoryNodeIds = new Set<string>();
 
+  const clearIds = (pending: Set<string>, ids: readonly string[]): void => {
+    for (const id of ids) pending.delete(id);
+  };
+
+  const hasEnabledPendingVegetation = (veg: TerrainEditVegetationState): boolean => (
+    (veg.grassEnabled && pendingGrassNodeIds.size > 0) ||
+    (veg.treesEnabled && pendingTreeNodeIds.size > 0) ||
+    (veg.understoryEnabled && pendingUnderstoryNodeIds.size > 0)
+  );
+
   const flushVegetationRebuilds = () => {
     vegetationFlushTimer = null;
     const veg = deps.getVegetationState();
 
     if (veg.grassEnabled && pendingGrassNodeIds.size > 0) {
-      deps.grassSystem?.rebuildNodePatches([...pendingGrassNodeIds]);
-      pendingGrassNodeIds.clear();
-      deps.refreshGrassStats();
+      const ids = [...pendingGrassNodeIds];
+      try {
+        deps.grassSystem?.rebuildNodePatches(ids);
+        deps.refreshGrassStats();
+        clearIds(pendingGrassNodeIds, ids);
+      } catch (error) {
+        console.error("grass rebuild after terrain edit failed:", error);
+      }
     }
     if (veg.treesEnabled && pendingTreeNodeIds.size > 0) {
-      const changedIds = [...pendingTreeNodeIds];
-      pendingTreeNodeIds.clear();
-      const fallen = deps.treeSystem?.removePatchesForNodes(changedIds) ?? [];
-      deps.fallingTrees.push(...fallen);
-      deps.treeSystem?.rebuildNodePatches(changedIds);
-      deps.refreshTreeStats();
+      const ids = [...pendingTreeNodeIds];
+      try {
+        const fallen = deps.treeSystem?.removePatchesForNodes(ids) ?? [];
+        deps.fallingTrees.push(...fallen);
+        deps.treeSystem?.rebuildNodePatches(ids);
+        deps.refreshTreeStats();
+        clearIds(pendingTreeNodeIds, ids);
+      } catch (error) {
+        console.error("tree rebuild after terrain edit failed:", error);
+      }
     }
     if (veg.understoryEnabled && pendingUnderstoryNodeIds.size > 0) {
-      deps.understorySystem?.rebuildNodePatches([...pendingUnderstoryNodeIds]);
-      pendingUnderstoryNodeIds.clear();
-      deps.refreshUnderstoryStats();
+      const ids = [...pendingUnderstoryNodeIds];
+      try {
+        deps.understorySystem?.rebuildNodePatches(ids);
+        deps.refreshUnderstoryStats();
+        clearIds(pendingUnderstoryNodeIds, ids);
+      } catch (error) {
+        console.error("understory rebuild after terrain edit failed:", error);
+      }
+    }
+
+    if (vegetationFlushTimer === null && hasEnabledPendingVegetation(deps.getVegetationState())) {
+      vegetationFlushTimer = setTimeout(flushVegetationRebuilds, VEGETATION_REBUILD_RETRY_MS);
     }
   };
 
@@ -127,27 +157,54 @@ export function createTerrainEditService(deps: TerrainEditServiceDeps): TerrainE
     deps.updateInfo();
   };
 
+  const reportRebuildFailure = (label: string, error: unknown): void => {
+    emitAudio("clod.rebuild.error");
+    if (error instanceof Error && error.name === "ClodBuildError") {
+      emitAudio("clod.validation.error");
+    }
+    console.error(`${label} rebuild failed:`, error);
+  };
+
+  const reportApplyFailure = (label: string, error: unknown): void => {
+    emitAudio("clod.rebuild.error");
+    const message = error instanceof Error ? error.message : String(error);
+    deps.setLastDigSummary(`apply failed: ${message}`);
+    deps.updateInfo();
+    console.error(`${label} apply failed after worker rebuild:`, error);
+  };
+
   const performEditRebuild = async (
     edit: DigEdit,
     hit: TerrainRebuildHit,
     radius: number,
     label: string,
-  ) => {
+  ): Promise<boolean> => {
     const t0 = performance.now();
     lastDigAt = t0;
     digRebuildsInFlight++;
     try {
       const margin = radius + DIG_INFLUENCE_MARGIN;
-      const lod0 = await deps.clodWorker.rebuildAfterDig(edit, {
-        minX: hit.point.x - margin,
-        maxX: hit.point.x + margin,
-        minZ: hit.point.z - margin,
-        maxZ: hit.point.z + margin,
-      });
+      let lod0: Awaited<ReturnType<ClodWorkerClient["rebuildAfterDig"]>>;
+      try {
+        lod0 = await deps.clodWorker.rebuildAfterDig(edit, {
+          minX: hit.point.x - margin,
+          maxX: hit.point.x + margin,
+          minZ: hit.point.z - margin,
+          maxZ: hit.point.z + margin,
+        });
+      } catch (error) {
+        reportRebuildFailure(label, error);
+        return false;
+      }
 
-      applyLod0Result(lod0.changed, lod0.pendingParents);
-      deps.setPendingParentNodes(0);
-      deps.setPendingParentMs(0);
+      try {
+        applyLod0Result(lod0.changed, lod0.pendingParents);
+        deps.setPendingParentNodes(0);
+        deps.setPendingParentMs(0);
+      } catch (error) {
+        reportApplyFailure(label, error);
+        return true;
+      }
 
       const totalMs = performance.now() - t0;
       const batchSuffix = lod0.requestCount > 1 ? ` · batch ${lod0.requestCount}` : "";
@@ -158,12 +215,7 @@ export function createTerrainEditService(deps: TerrainEditServiceDeps): TerrainE
       console.log(
         `[${label} ${edit.op ?? "edit"} ${edit.shape ?? "sphere"} r=${radius}] at (${hit.point.x.toFixed(1)},${hit.point.y.toFixed(1)},${hit.point.z.toFixed(1)}) — ${summary} — ${lod0.pendingParents} ancestors queued in worker`,
       );
-    } catch (error) {
-      emitAudio("clod.rebuild.error");
-      if (error instanceof Error && error.name === "ClodBuildError") {
-        emitAudio("clod.validation.error");
-      }
-      console.error(`${label} rebuild failed:`, error);
+      return true;
     } finally {
       digRebuildsInFlight--;
     }
@@ -184,13 +236,20 @@ export function createTerrainEditService(deps: TerrainEditServiceDeps): TerrainE
       material: brushParams.brushOp === "add" ? brushParams.brushMaterial : undefined,
       height: brushParams.brushHeight, strength: brushParams.brushStrength, falloff: brushParams.brushFalloff,
     };
-    const hadPaintedTerrain = getDigEditsSnapshot().some((existing) => existing.op === "add");
+    const previousEdits = getDigEditsSnapshot();
+    const hadPaintedTerrain = previousEdits.some((existing) => existing.op === "add");
     addDigEdit(edit);
-    if (!hadPaintedTerrain && edit.op === "add") deps.applyTerrainTextures();
 
     emitAudio(brushParams.brushOp === "add" ? "terrain.raise" : "terrain.dig.tick");
 
-    await performEditRebuild(edit, hit, radius, `${brushParams.brushOp} ${brushParams.brushShape}`);
+    const ok = await performEditRebuild(edit, hit, radius, `${brushParams.brushOp} ${brushParams.brushShape}`);
+    if (!ok) {
+      replaceDigEdits(previousEdits);
+      if (!hadPaintedTerrain && edit.op === "add") deps.applyTerrainTextures();
+      deps.updateInfo();
+      return;
+    }
+    if (!hadPaintedTerrain && edit.op === "add") deps.applyTerrainTextures();
   };
 
   const performConstructionTerrainConform = async (request: ConstructionTerrainConformRequest) => {
@@ -221,14 +280,27 @@ export function createTerrainEditService(deps: TerrainEditServiceDeps): TerrainE
       falloff: request.falloffM,
     };
 
-    const hadPaintedTerrain = getDigEditsSnapshot().some((existing) => existing.op === "add");
+    const beforeFill = getDigEditsSnapshot();
+    const hadPaintedTerrain = beforeFill.some((existing) => existing.op === "add");
     addDigEdit(fillEdit);
-    if (request.trimHeightM > 0) addDigEdit(trimEdit);
-    if (!hadPaintedTerrain) deps.applyTerrainTextures();
     emitAudio("terrain.raise");
-    await performEditRebuild(fillEdit, hit, radius, "construction terrain fill");
+    const fillOk = await performEditRebuild(fillEdit, hit, radius, "construction terrain fill");
+    if (!fillOk) {
+      replaceDigEdits(beforeFill);
+      if (!hadPaintedTerrain) deps.applyTerrainTextures();
+      deps.updateInfo();
+      return;
+    }
+    if (!hadPaintedTerrain) deps.applyTerrainTextures();
+
     if (request.trimHeightM > 0) {
-      await performEditRebuild(trimEdit, hit, radius, "construction terrain trim");
+      const beforeTrim = getDigEditsSnapshot();
+      addDigEdit(trimEdit);
+      const trimOk = await performEditRebuild(trimEdit, hit, radius, "construction terrain trim");
+      if (!trimOk) {
+        replaceDigEdits(beforeTrim);
+        deps.updateInfo();
+      }
     }
   };
 

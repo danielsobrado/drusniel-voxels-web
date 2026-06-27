@@ -7,6 +7,8 @@ import {
   clampPlayerToWorld,
   jumpVelocityForHeight,
   normalizeMovementInput,
+  validatePlayerWorldBoundsFit,
+  worldEdgePushbackAcceleration,
 } from "./player_controller.js";
 import { TerrainColliderSet, type TerrainColliderPage } from "./terrain/terrain_collider.js";
 
@@ -60,6 +62,8 @@ describe("player movement helpers", () => {
       eyeHeight: 1.7,
       maxSlopeDegrees: 60,
       worldEdgeMargin: 16,
+      worldEdgePushbackBand: 48,
+      worldEdgePushbackAcceleration: 36,
     });
   });
 
@@ -77,6 +81,91 @@ describe("player movement helpers", () => {
     const position = new THREE.Vector3(2, 5, 127);
     clampPlayerToWorld(position, { minX: 0, minZ: 0, maxX: 128, maxZ: 128 }, 16);
     expect(position.toArray()).toEqual([16, 5, 112]);
+  });
+
+  it("validates player bounds have room for the edge margin", () => {
+    expect(() =>
+      validatePlayerWorldBoundsFit(
+        { minX: 0, minZ: 0, maxX: 128, maxZ: 128 },
+        DEFAULT_PLAYER_CONFIG,
+      ),
+    ).not.toThrow();
+  });
+
+  it("fails when player bounds are smaller than the edge margin", () => {
+    expect(() =>
+      validatePlayerWorldBoundsFit(
+        { minX: 0, minZ: 0, maxX: 24, maxZ: 128 },
+        DEFAULT_PLAYER_CONFIG,
+      ),
+    ).toThrow("Player world bounds too small for margin 16");
+  });
+
+  it("fails when player bounds are inverted", () => {
+    expect(() =>
+      validatePlayerWorldBoundsFit(
+        { minX: 128, minZ: 0, maxX: 0, maxZ: 128 },
+        DEFAULT_PLAYER_CONFIG,
+      ),
+    ).toThrow("Player world bounds must have positive width and depth");
+  });
+
+  it("fails when player bounds are not finite", () => {
+    expect(() =>
+      validatePlayerWorldBoundsFit(
+        { minX: 0, minZ: 0, maxX: Number.NaN, maxZ: 128 },
+        DEFAULT_PLAYER_CONFIG,
+      ),
+    ).toThrow("Player world bounds must be finite numbers");
+  });
+
+  it("fails when player margin is not finite", () => {
+    expect(() =>
+      validatePlayerWorldBoundsFit(
+        { minX: 0, minZ: 0, maxX: 128, maxZ: 128 },
+        { ...DEFAULT_PLAYER_CONFIG, worldEdgeMargin: Number.NaN },
+      ),
+    ).toThrow("Player world edge margin must be a finite number greater than 0");
+  });
+
+  it("fails when player pushback band is not finite", () => {
+    expect(() =>
+      validatePlayerWorldBoundsFit(
+        { minX: 0, minZ: 0, maxX: 128, maxZ: 128 },
+        { ...DEFAULT_PLAYER_CONFIG, worldEdgePushbackBand: Number.NaN },
+      ),
+    ).toThrow("Player world edge pushback band must be a finite number greater than or equal to 0");
+  });
+
+  it("fails when player pushback acceleration is negative", () => {
+    expect(() =>
+      validatePlayerWorldBoundsFit(
+        { minX: 0, minZ: 0, maxX: 128, maxZ: 128 },
+        { ...DEFAULT_PLAYER_CONFIG, worldEdgePushbackAcceleration: -1 },
+      ),
+    ).toThrow("Player world edge pushback acceleration must be a finite number greater than or equal to 0");
+  });
+
+  it("does not push inside the safe center", () => {
+    const push = worldEdgePushbackAcceleration(
+      new THREE.Vector3(64, 0, 64),
+      { minX: 0, minZ: 0, maxX: 128, maxZ: 128 },
+      16,
+      24,
+      36,
+    );
+    expect(push.toArray()).toEqual([0, 0]);
+  });
+
+  it("pushes inward before the hard world clamp", () => {
+    const bounds = { minX: 0, minZ: 0, maxX: 128, maxZ: 128 };
+    const fromMin = worldEdgePushbackAcceleration(new THREE.Vector3(20, 0, 20), bounds, 16, 24, 36);
+    const fromMax = worldEdgePushbackAcceleration(new THREE.Vector3(108, 0, 108), bounds, 16, 24, 36);
+
+    expect(fromMin.x).toBeGreaterThan(0);
+    expect(fromMin.y).toBeGreaterThan(0);
+    expect(fromMax.x).toBeLessThan(0);
+    expect(fromMax.y).toBeLessThan(0);
   });
 });
 

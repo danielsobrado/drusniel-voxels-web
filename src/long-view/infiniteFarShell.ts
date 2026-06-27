@@ -11,6 +11,11 @@ import {
   updateFarTerrainMaterialCenter,
   updateFarTerrainMaterialSummaryAtlas,
 } from "../farTerrain/farTerrainMaterial.js";
+import {
+  createFarWaterMaterial,
+  updateFarWaterMaterialCenter,
+  updateFarWaterMaterialSummaryAtlas,
+} from "../farTerrain/farWaterMaterial.js";
 import type { FarTerrainUniformData } from "../farTerrain/farTerrainUniforms.js";
 import type { FarSummaryGpuAtlasView } from "../naadf/gpu/farSummaryAtlas.js";
 
@@ -51,11 +56,16 @@ export interface SnappedCenter {
 
 function resolveHeightSamplingMode(options: InfiniteFarShellOptions): FarShellHeightSamplingMode {
   const requested = options.heightSamplingMode ?? "cpu";
-  return requested === "gpu" && options.useParityMaterial && options.parityConfig ? "gpu" : "cpu";
+  if (requested !== "gpu") return "cpu";
+  if (!options.useParityMaterial || !options.parityConfig || !options.farSummaryGpuAtlas) {
+    throw new Error("Far shell GPU mode requires parity material, parity config, and a GPU far-summary atlas");
+  }
+  return "gpu";
 }
 
 export class InfiniteFarShell {
   readonly mesh: THREE.Mesh;
+  private readonly waterMesh: THREE.Mesh | undefined;
   private readonly options: InfiniteFarShellOptions;
   private readonly samplerOptions: FarSummarySamplerOptions;
   private readonly metrics: FarShellMetrics;
@@ -142,6 +152,21 @@ export class InfiniteFarShell {
     this.mesh.castShadow = false;
     this.mesh.receiveShadow = false;
     this.mesh.frustumCulled = false;
+
+    if (this.heightSamplingMode === "gpu" && this.farSummaryGpuAtlas && useParity) {
+      const waterMaterial = createFarWaterMaterial(0, 0, this.farSummaryGpuAtlas);
+      if (options.debugShowWireframe) (waterMaterial as unknown as { wireframe: boolean }).wireframe = true;
+      this.waterMesh = new THREE.Mesh(geometry, waterMaterial);
+      this.waterMesh.name = "naadf-far-water-overlay";
+      this.waterMesh.castShadow = false;
+      this.waterMesh.receiveShadow = false;
+      this.waterMesh.frustumCulled = false;
+      this.waterMesh.renderOrder = 12;
+      this.waterMesh.userData["renderOnly"] = true;
+      this.waterMesh.userData["collisionEnabled"] = false;
+      this.mesh.add(this.waterMesh);
+    }
+
     if (useParity) this.attachGpuDefaultVertexColors(vertexCount);
     this.metrics.farShellVertices = vertexCount;
     this.metrics.farShellTriangles = this.indices.length / 3;
@@ -198,6 +223,9 @@ export class InfiniteFarShell {
 
   setDebugShowWireframe(on: boolean): void {
     (this.mesh.material as unknown as { wireframe: boolean }).wireframe = on;
+    if (this.waterMesh && !Array.isArray(this.waterMesh.material)) {
+      (this.waterMesh.material as unknown as { wireframe: boolean }).wireframe = on;
+    }
   }
 
   setReceiveSunShadows(on: boolean): void {
@@ -225,6 +253,11 @@ export class InfiniteFarShell {
       if (this.heightSamplingMode === "gpu" && this.farSummaryGpuAtlas) {
         updateFarTerrainMaterialSummaryAtlas(material, this.farSummaryGpuAtlas);
       }
+    }
+    if (this.waterMesh && this.farSummaryGpuAtlas) {
+      const waterMaterial = this.waterMesh.material as import("three/webgpu").MeshBasicNodeMaterial;
+      updateFarWaterMaterialCenter(waterMaterial, this.snappedX, this.snappedZ);
+      updateFarWaterMaterialSummaryAtlas(waterMaterial, this.farSummaryGpuAtlas);
     }
   }
 
@@ -318,6 +351,15 @@ export class InfiniteFarShell {
   }
 
   dispose(): void {
+    if (this.waterMesh) {
+      this.waterMesh.removeFromParent();
+      const waterMat = this.waterMesh.material;
+      if (Array.isArray(waterMat)) {
+        for (const m of waterMat) m.dispose();
+      } else {
+        waterMat.dispose();
+      }
+    }
     const geometry = this.mesh.geometry;
     geometry.dispose();
     const mat = this.mesh.material;

@@ -1,11 +1,20 @@
 import * as THREE from "three";
 import type { DeepOceanRenderConfig } from "../terrain/border_coast_config.js";
-import { deepOceanWaveVerticalBounds } from "./deep_ocean_waves.js";
+import { deepOceanGpuWaves, deepOceanWaveVerticalBounds } from "./deep_ocean_waves.js";
 
 export interface DeepOceanSurface {
   mesh: THREE.Mesh;
   update(timeSeconds: number): void;
   dispose(): void;
+}
+
+interface RectGridSpec {
+  xMin: number;
+  xMax: number;
+  zMin: number;
+  zMax: number;
+  segX: number;
+  segZ: number;
 }
 
 function addRectGrid(
@@ -50,69 +59,117 @@ function addRectGrid(
   vertexOffset.value = base + (rows + 1) * (cols + 1);
 }
 
-function rectGridVertexCount(
-  xMin: number,
-  xMax: number,
-  zMin: number,
-  zMax: number,
-  segX: number,
-  segZ: number,
-): number {
-  if (xMax <= xMin || zMax <= zMin) return 0;
-  return (Math.max(1, segX) + 1) * (Math.max(1, segZ) + 1);
+function rectGridVertexCount(spec: RectGridSpec): number {
+  if (spec.xMax <= spec.xMin || spec.zMax <= spec.zMin) return 0;
+  return (Math.max(1, spec.segX) + 1) * (Math.max(1, spec.segZ) + 1);
 }
 
-function deepOceanGridLayout(worldCells: number, config: DeepOceanRenderConfig, _innerBandCells: number) {
+function rectGridTriangleCount(spec: RectGridSpec): number {
+  if (spec.xMax <= spec.xMin || spec.zMax <= spec.zMin) return 0;
+  return Math.max(1, spec.segX) * Math.max(1, spec.segZ) * 2;
+}
+
+function visitRectGridVertices(spec: RectGridSpec, visit: (x: number, z: number) => void): void {
+  if (spec.xMax <= spec.xMin || spec.zMax <= spec.zMin) return;
+  const cols = Math.max(1, spec.segX);
+  const rows = Math.max(1, spec.segZ);
+  for (let row = 0; row <= rows; row++) {
+    const z = spec.zMin + (spec.zMax - spec.zMin) * (row / rows);
+    for (let col = 0; col <= cols; col++) {
+      const x = spec.xMin + (spec.xMax - spec.xMin) * (col / cols);
+      visit(x, z);
+    }
+  }
+}
+
+function deepOceanGridLayout(worldCells: number, config: DeepOceanRenderConfig) {
   const extend = Math.max(1, config.extendCells);
+  const startOutside = Math.min(Math.max(0, config.startOutsideBorderM), Math.max(0, extend - 1));
   const segments = Math.max(4, config.segments);
   const outerMin = -extend;
   const outerMax = worldCells + extend;
-  const innerMin = 0;
-  const innerMax = worldCells;
-  const ringWidth = Math.max(extend, 1);
+  const holeMin = -startOutside;
+  const holeMax = worldCells + startOutside;
+  const ringWidth = Math.max(extend - startOutside, 1);
   const radialSegments = Math.max(4, Math.round(segments * ringWidth / Math.max(ringWidth, worldCells * 0.25)));
   const tangentialSegments = segments;
-  return {
-    outerMin,
-    outerMax,
-    innerMin,
-    innerMax,
-    radialSegments,
-    tangentialSegments,
-  };
+  return { outerMin, outerMax, holeMin, holeMax, radialSegments, tangentialSegments };
 }
 
-/**
- * Render-only deep ocean ring. Vertices stay static on CPU; wave displacement,
- * chop, compression, and foam are evaluated in the GPU material.
- */
+function deepOceanGridSpecs(worldCells: number, config: DeepOceanRenderConfig): RectGridSpec[] {
+  const { outerMin, outerMax, holeMin, holeMax, radialSegments, tangentialSegments } = deepOceanGridLayout(worldCells, config);
+  return [
+    { xMin: outerMin, xMax: outerMax, zMin: holeMax, zMax: outerMax, segX: tangentialSegments, segZ: radialSegments },
+    { xMin: outerMin, xMax: outerMax, zMin: outerMin, zMax: holeMin, segX: tangentialSegments, segZ: radialSegments },
+    { xMin: outerMin, xMax: holeMin, zMin: holeMin, zMax: holeMax, segX: radialSegments, segZ: tangentialSegments },
+    { xMin: holeMax, xMax: outerMax, zMin: holeMin, zMax: holeMax, segX: radialSegments, segZ: tangentialSegments },
+  ];
+}
+
+function insideStrictRect(x: number, z: number, min: number, max: number): boolean {
+  return x > min && x < max && z > min && z < max;
+}
+
+function insideClosedRect(x: number, z: number, min: number, max: number): boolean {
+  return x >= min && x <= max && z >= min && z <= max;
+}
+
+export function isInDeepOceanTransitionGap(
+  x: number,
+  z: number,
+  worldCells: number,
+  startOutsideBorderM: number,
+): boolean {
+  const start = Math.max(0, startOutsideBorderM);
+  if (insideClosedRect(x, z, 0, worldCells)) return false;
+  return insideStrictRect(x, z, -start, worldCells + start);
+}
+
+export function countDeepOceanTransitionGapVertices(worldCells: number, config: DeepOceanRenderConfig): number {
+  if (!config.enabled || worldCells <= 0) return 0;
+  let count = 0;
+  for (const spec of deepOceanGridSpecs(worldCells, config)) {
+    visitRectGridVertices(spec, (x, z) => {
+      if (isInDeepOceanTransitionGap(x, z, worldCells, config.startOutsideBorderM)) count += 1;
+    });
+  }
+  return count;
+}
+
 export function createDeepOceanSurface(
   worldCells: number,
   config: DeepOceanRenderConfig,
   material: THREE.Material,
-  innerBandCells = 0,
 ): DeepOceanSurface | null {
   if (!config.enabled || worldCells <= 0) return null;
 
   const y = config.surfaceY;
-  const layout = deepOceanGridLayout(worldCells, config, innerBandCells);
-  const { outerMin, outerMax, innerMin, innerMax, radialSegments, tangentialSegments } = layout;
-
   const positions: number[] = [];
   const indices: number[] = [];
   const vertexOffset = { value: 0 };
 
-  addRectGrid(positions, indices, outerMin, outerMax, innerMax, outerMax, tangentialSegments, radialSegments, y, vertexOffset);
-  addRectGrid(positions, indices, outerMin, outerMax, outerMin, innerMin, tangentialSegments, radialSegments, y, vertexOffset);
-  addRectGrid(positions, indices, outerMin, innerMin, innerMin, innerMax, radialSegments, tangentialSegments, y, vertexOffset);
-  addRectGrid(positions, indices, innerMax, outerMax, innerMin, innerMax, radialSegments, tangentialSegments, y, vertexOffset);
+  for (const spec of deepOceanGridSpecs(worldCells, config)) {
+    addRectGrid(
+      positions,
+      indices,
+      spec.xMin,
+      spec.xMax,
+      spec.zMin,
+      spec.zMax,
+      spec.segX,
+      spec.segZ,
+      y,
+      vertexOffset,
+    );
+  }
 
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
   geometry.setIndex(indices);
   geometry.computeVertexNormals();
   geometry.computeBoundingSphere();
-  const waveBounds = deepOceanWaveVerticalBounds();
+  const waveBounds = deepOceanWaveVerticalBounds(deepOceanGpuWaves(config.wave));
+  const { outerMin, outerMax } = deepOceanGridLayout(worldCells, config);
   geometry.boundingBox = new THREE.Box3(
     new THREE.Vector3(outerMin - waveBounds, y - waveBounds, outerMin - waveBounds),
     new THREE.Vector3(outerMax + waveBounds, y + waveBounds, outerMax + waveBounds),
@@ -125,23 +182,20 @@ export function createDeepOceanSurface(
 
   return {
     mesh,
-    update(_timeSeconds: number) {
-      // Time is pushed to the GPU material; CPU geometry is intentionally immutable.
-    },
+    update(_timeSeconds: number) {},
     dispose() {
       geometry.dispose();
-      mesh.parent?.remove(mesh);
+      mesh.removeFromParent();
     },
   };
 }
 
-/** Vertex count for tests and diagnostics. */
-export function deepOceanSurfaceVertexCount(worldCells: number, config: DeepOceanRenderConfig, innerBandCells = 0): number {
+export function deepOceanSurfaceVertexCount(worldCells: number, config: DeepOceanRenderConfig): number {
   if (!config.enabled || worldCells <= 0) return 0;
-  const layout = deepOceanGridLayout(worldCells, config, innerBandCells);
-  const { outerMin, outerMax, innerMin, innerMax, radialSegments, tangentialSegments } = layout;
-  return rectGridVertexCount(outerMin, outerMax, innerMax, outerMax, tangentialSegments, radialSegments)
-    + rectGridVertexCount(outerMin, outerMax, outerMin, innerMin, tangentialSegments, radialSegments)
-    + rectGridVertexCount(outerMin, innerMin, innerMin, innerMax, radialSegments, tangentialSegments)
-    + rectGridVertexCount(innerMax, outerMax, innerMin, innerMax, radialSegments, tangentialSegments);
+  return deepOceanGridSpecs(worldCells, config).reduce((total, spec) => total + rectGridVertexCount(spec), 0);
+}
+
+export function deepOceanSurfaceTriangleCount(worldCells: number, config: DeepOceanRenderConfig): number {
+  if (!config.enabled || worldCells <= 0) return 0;
+  return deepOceanGridSpecs(worldCells, config).reduce((total, spec) => total + rectGridTriangleCount(spec), 0);
 }

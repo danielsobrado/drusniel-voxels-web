@@ -67,6 +67,8 @@ function atlasView(ringCount: number): FarSummaryGpuAtlasView {
   return {
     texture: texture(widthCells, heightCells),
     materialTexture: texture(widthCells, heightCells),
+    normalTexture: texture(widthCells, heightCells),
+    coverageTexture: texture(widthCells, heightCells),
     rings: Array.from({ length: ringCount }, (_, index) => ({
       originX: 0,
       originZ: 0,
@@ -106,5 +108,7 @@ describe("far terrain GPU atlas material", () => {
     material.dispose();
     atlas.texture.dispose();
     atlas.materialTexture.dispose();
+    atlas.normalTexture.dispose();
+    atlas.coverageTexture.dispose();
   });
 });

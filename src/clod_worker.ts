@@ -9,11 +9,19 @@ import {
   type DirtyCellBounds,
   type NodeIndex,
 } from "./clod/quadtree.js";
+import { nextPendingParentLevelOrdered } from "./clod/parent_queue.js";
 import { initClodCacheContext, clearWorkerPersistentCache, type ClodCacheContext } from "./cache/clodCacheContext.js";
 import { isCacheRpcResponse } from "./cache/cacheWorkerRpc.js";
 import { dispatchCacheRpcResponse } from "./cache/workerRemotePersistentStore.js";
 import { createBuildCacheHooks, type CachedBuildStats } from "./cache/clodBuildCache.js";
-import { addDigEdit, replaceVoxelEdits, setBorderCoastRuntime, setTerrainSurfaceOverride } from "./terrain/terrain.js";
+import {
+  addDigEdit,
+  getDigEditsSnapshot,
+  replaceDigEdits,
+  replaceVoxelEdits,
+  setBorderCoastRuntime,
+  setTerrainSurfaceOverride,
+} from "./terrain/terrain.js";
 import {
   collectBuildResultTransferables,
   collectNodeTransferables,
@@ -24,7 +32,9 @@ import {
   type SerializedHydrologyTerrain,
 } from "./clod_worker_protocol.js";
 import type { ClodPagesConfig } from "./config.js";
-import type { ClodPageNode } from "./types.js";
+import type { ClodPageNode, PageMesh } from "./types.js";
+
+const DIRTY_BOUNDS_MAX_EPSILON = 1e-6;
 
 const ctx = self as unknown as {
   postMessage: (message: ClodWorkerResponse, transfer?: Transferable[]) => void;
@@ -41,6 +51,8 @@ let parentNodes = 0;
 let parentMs = 0;
 let drainScheduled = false;
 const pendingByLevel = new Map<number, Set<string>>();
+/** Child page coords resimplified at level L; flushed to enqueue level L+1 once level L drains. */
+const pendingChildCoordsByLevel = new Map<number, [number, number][]>();
 
 interface CombinedLod0Rebuild {
   changed: ClodPageNode[];
@@ -51,6 +63,29 @@ interface CombinedLod0Rebuild {
   chunksTotal: number;
 }
 
+interface Lod0Snapshot {
+  node: ClodPageNode;
+  mesh: PageMesh;
+  bounds: ClodPageNode["bounds"];
+  chunkMeshes?: PageMesh[];
+}
+
+interface ParentNodeSnapshot {
+  node: ClodPageNode;
+  mesh: PageMesh;
+  bounds: ClodPageNode["bounds"];
+  errorWorld: number;
+  lowBenefit: boolean;
+}
+
+interface ParentQueueSnapshot {
+  pendingByLevel: Map<number, Set<string>>;
+  pendingChildCoordsByLevel: Map<number, [number, number][]>;
+  activeParentRequestId: number | null;
+  parentNodes: number;
+  parentMs: number;
+}
+
 function mergeDirty(a: DirtyCellBounds, b: DirtyCellBounds): DirtyCellBounds {
   return {
     minX: Math.min(a.minX, b.minX),
@@ -58,6 +93,113 @@ function mergeDirty(a: DirtyCellBounds, b: DirtyCellBounds): DirtyCellBounds {
     minZ: Math.min(a.minZ, b.minZ),
     maxZ: Math.max(a.maxZ, b.maxZ),
   };
+}
+
+function intersectDirty(a: DirtyCellBounds, b: DirtyCellBounds): DirtyCellBounds | null {
+  const clipped = {
+    minX: Math.max(a.minX, b.minX),
+    maxX: Math.min(a.maxX, b.maxX),
+    minZ: Math.max(a.minZ, b.minZ),
+    maxZ: Math.min(a.maxZ, b.maxZ),
+  };
+  return clipped.minX < clipped.maxX && clipped.minZ < clipped.maxZ ? clipped : null;
+}
+
+function cloneBounds(bounds: ClodPageNode["bounds"]): ClodPageNode["bounds"] {
+  return {
+    center: [...bounds.center],
+    radius: bounds.radius,
+    minY: bounds.minY,
+    maxY: bounds.maxY,
+  };
+}
+
+function snapshotLod0Node(node: ClodPageNode): Lod0Snapshot {
+  return {
+    node,
+    mesh: node.mesh,
+    bounds: cloneBounds(node.bounds),
+    chunkMeshes: node.chunkMeshes ? [...node.chunkMeshes] : undefined,
+  };
+}
+
+function snapshotLod0Nodes(regions: readonly DirtyCellBounds[]): Lod0Snapshot[] {
+  if (!result || !cfg || !index) return [];
+  const span = cfg.page.chunks_per_page * cfg.page.chunk_size;
+  const keys = new Set<string>();
+  for (const dirty of pageParentDirtyGroups(regions)) {
+    const touched: [number, number][] = [];
+    const minPx = Math.max(0, Math.floor(dirty.minX / span));
+    const maxPx = Math.min(result.worldPagesX - 1, Math.floor(dirty.maxX / span));
+    const minPz = Math.max(0, Math.floor(dirty.minZ / span));
+    const maxPz = Math.min(result.worldPagesZ - 1, Math.floor(dirty.maxZ / span));
+    for (let pz = minPz; pz <= maxPz; pz++) {
+      for (let px = minPx; px <= maxPx; px++) touched.push([px, pz]);
+    }
+    for (const [px, pz] of expandQuadSiblingPages(touched, 0, result.worldPagesX, result.worldPagesZ)) {
+      keys.add(`${px},${pz}`);
+    }
+  }
+  const snapshots: Lod0Snapshot[] = [];
+  for (const key of keys) {
+    const node = index[0]?.get(key);
+    if (node) snapshots.push(snapshotLod0Node(node));
+  }
+  return snapshots;
+}
+
+function restoreLod0Nodes(snapshots: readonly Lod0Snapshot[]): void {
+  for (const snapshot of snapshots) {
+    snapshot.node.mesh = snapshot.mesh;
+    snapshot.node.bounds = cloneBounds(snapshot.bounds);
+    if (snapshot.chunkMeshes) snapshot.node.chunkMeshes = snapshot.chunkMeshes;
+    else delete snapshot.node.chunkMeshes;
+  }
+}
+
+function snapshotParentNode(node: ClodPageNode): ParentNodeSnapshot {
+  return {
+    node,
+    mesh: node.mesh,
+    bounds: cloneBounds(node.bounds),
+    errorWorld: node.errorWorld,
+    lowBenefit: node.lowBenefit,
+  };
+}
+
+function restoreParentNodes(snapshots: ReadonlyMap<ClodPageNode, ParentNodeSnapshot>): void {
+  for (const [node, snapshot] of snapshots) {
+    node.mesh = snapshot.mesh;
+    node.bounds = cloneBounds(snapshot.bounds);
+    node.errorWorld = snapshot.errorWorld;
+    node.lowBenefit = snapshot.lowBenefit;
+  }
+}
+
+function snapshotParentQueue(): ParentQueueSnapshot {
+  const copy = new Map<number, Set<string>>();
+  for (const [level, keys] of pendingByLevel) copy.set(level, new Set(keys));
+  const childCopy = new Map<number, [number, number][]>();
+  for (const [level, coords] of pendingChildCoordsByLevel) childCopy.set(level, coords.map((c) => [...c] as [number, number]));
+  return {
+    pendingByLevel: copy,
+    pendingChildCoordsByLevel: childCopy,
+    activeParentRequestId,
+    parentNodes,
+    parentMs,
+  };
+}
+
+function restoreParentQueue(snapshot: ParentQueueSnapshot): void {
+  pendingByLevel.clear();
+  for (const [level, keys] of snapshot.pendingByLevel) pendingByLevel.set(level, new Set(keys));
+  pendingChildCoordsByLevel.clear();
+  for (const [level, coords] of snapshot.pendingChildCoordsByLevel) {
+    pendingChildCoordsByLevel.set(level, coords.map((c) => [...c] as [number, number]));
+  }
+  activeParentRequestId = snapshot.activeParentRequestId;
+  parentNodes = snapshot.parentNodes;
+  parentMs = snapshot.parentMs;
 }
 
 function installHydrologyTerrain(terrain: SerializedHydrologyTerrain | null | undefined): void {
@@ -139,63 +281,99 @@ function enqueueParentsForChildren(childLevel: number, childCoords: readonly [nu
   enqueueParentSiblingGroup(childLevel + 1, uniqueParentCoords(childCoords));
 }
 
+function clearPendingParentsFrom(level: number): void {
+  for (let l = level; l <= topLevel; l++) pendingByLevel.delete(l);
+  for (const l of [...pendingChildCoordsByLevel.keys()]) {
+    if (l >= level - 1) pendingChildCoordsByLevel.delete(l);
+  }
+}
+
+function recordResimplifiedChild(level: number, nx: number, nz: number): void {
+  let coords = pendingChildCoordsByLevel.get(level);
+  if (!coords) {
+    coords = [];
+    pendingChildCoordsByLevel.set(level, coords);
+  }
+  coords.push([nx, nz]);
+}
+
+function flushChildEnqueues(completedLevel: number): void {
+  const coords = pendingChildCoordsByLevel.get(completedLevel);
+  pendingChildCoordsByLevel.delete(completedLevel);
+  if (!coords || coords.length === 0) return;
+  enqueueParentSiblingGroup(completedLevel + 1, uniqueParentCoords(coords));
+}
+
 function enqueueParentsForLod0(coords: readonly [number, number][]): void {
+  clearPendingParentsFrom(1);
   enqueueParentsForChildren(0, coords);
 }
 
 function nextPendingParent(): { level: number; key: string } | null {
-  for (let level = 1; level <= topLevel; level++) {
-    const set = pendingByLevel.get(level);
-    if (!set || set.size === 0) continue;
-    const key = set.values().next().value as string;
-    set.delete(key);
-    return { level, key };
-  }
-  return null;
+  return nextPendingParentLevelOrdered(pendingByLevel, topLevel);
 }
 
 function drainParents(budgetMs: number): void {
   if (!cfg || !index) return;
   const startedAt = performance.now();
   const changed: ClodPageNode[] = [];
+  const parentQueueSnapshot = snapshotParentQueue();
+  const parentSnapshots = new Map<ClodPageNode, ParentNodeSnapshot>();
+  let committed = false;
 
-  while (pendingParentCount() > 0 && performance.now() - startedAt < budgetMs) {
-    const next = nextPendingParent();
-    if (!next) break;
-    const t0 = performance.now();
-    const node = resimplifyParent(index, next.level, next.key, cfg);
-    parentMs += performance.now() - t0;
-    if (!node) continue;
-    parentNodes++;
-    changed.push(node);
-    const [nx, nz] = next.key.split(",").map(Number) as [number, number];
-    enqueueParentsForChildren(next.level, [[nx, nz]]);
-  }
+  try {
+    while (pendingParentCount() > 0 && performance.now() - startedAt < budgetMs) {
+      const next = nextPendingParent();
+      if (!next) break;
+      const target = index[next.level]?.get(next.key);
+      if (target && !parentSnapshots.has(target)) parentSnapshots.set(target, snapshotParentNode(target));
+      const t0 = performance.now();
+      const node = resimplifyParent(index, next.level, next.key, cfg, next.level === topLevel);
+      parentMs += performance.now() - t0;
+      if (!node) continue;
+      parentNodes++;
+      changed.push(node);
+      const [nx, nz] = next.key.split(",").map(Number) as [number, number];
+      recordResimplifiedChild(next.level, nx, nz);
+      const levelSet = pendingByLevel.get(next.level);
+      if (!levelSet || levelSet.size === 0) flushChildEnqueues(next.level);
+    }
 
-  if (changed.length > 0) {
-    const serialized = serializeNodes(changed);
-    const transferables: Transferable[] = [];
-    for (const node of serialized) collectNodeTransferables(node, transferables);
-    post({
-      type: "parentRebuilt",
-      requestId: activeParentRequestId,
-      changed: serialized,
-      parentNodes,
-      parentMs,
-      pendingParents: pendingParentCount(),
-    }, transferables);
+    if (changed.length > 0) {
+      const serialized = serializeNodes(changed);
+      const transferables: Transferable[] = [];
+      for (const node of serialized) collectNodeTransferables(node, transferables);
+      post({
+        type: "parentRebuilt",
+        requestId: activeParentRequestId,
+        changed: serialized,
+        parentNodes,
+        parentMs,
+        pendingParents: pendingParentCount(),
+      }, transferables);
+    }
+    committed = true;
+  } catch (error) {
+    if (!committed) {
+      restoreParentNodes(parentSnapshots);
+      restoreParentQueue(parentQueueSnapshot);
+    }
+    throw error;
   }
 
   if (pendingParentCount() === 0 && activeParentRequestId !== null) {
-    post({
-      type: "parentsComplete",
-      requestId: activeParentRequestId,
-      parentNodes,
-      parentMs,
-    });
+    const completedRequestId = activeParentRequestId;
+    const completedParentNodes = parentNodes;
+    const completedParentMs = parentMs;
     activeParentRequestId = null;
     parentNodes = 0;
     parentMs = 0;
+    post({
+      type: "parentsComplete",
+      requestId: completedRequestId,
+      parentNodes: completedParentNodes,
+      parentMs: completedParentMs,
+    });
   }
 }
 
@@ -205,7 +383,7 @@ function scheduleParentDrain(): void {
   setTimeout(() => {
     drainScheduled = false;
     try {
-      drainParents(8);
+      drainParents(16);
       if (pendingParentCount() > 0) scheduleParentDrain();
     } catch (error) {
       post(errorResponse(activeParentRequestId, error));
@@ -228,6 +406,7 @@ async function handleBuild(request: Extract<ClodWorkerRequest, { type: "build" }
   installHydrologyTerrain(request.hydrologyTerrain);
   installBorderCoastRuntime(request.borderCoastOceanConfig, request.worldPagesX, request.cfg);
   pendingByLevel.clear();
+  pendingChildCoordsByLevel.clear();
   activeParentRequestId = null;
   parentNodes = 0;
   parentMs = 0;
@@ -274,6 +453,23 @@ async function handleBuild(request: Extract<ClodWorkerRequest, { type: "build" }
   }, collectBuildResultTransferables(serialized));
 }
 
+function inclusiveMaxBoundary(value: number): number {
+  return value - DIRTY_BOUNDS_MAX_EPSILON;
+}
+
+function parentGroupFootprint(parentX: number, parentZ: number): DirtyCellBounds {
+  if (!result || !cfg) throw new Error("CLOD worker received a dig before build completion");
+  const span = cfg.page.chunks_per_page * cfg.page.chunk_size;
+  const worldMaxX = result.worldPagesX * span;
+  const worldMaxZ = result.worldPagesZ * span;
+  return {
+    minX: parentX * 2 * span,
+    maxX: inclusiveMaxBoundary(Math.min(worldMaxX, (parentX * 2 + 2) * span)),
+    minZ: parentZ * 2 * span,
+    maxZ: inclusiveMaxBoundary(Math.min(worldMaxZ, (parentZ * 2 + 2) * span)),
+  };
+}
+
 function pageParentDirtyGroups(regions: readonly DirtyCellBounds[]): DirtyCellBounds[] {
   if (!result || !cfg) throw new Error("CLOD worker received a dig before build completion");
   const span = cfg.page.chunks_per_page * cfg.page.chunk_size;
@@ -285,9 +481,13 @@ function pageParentDirtyGroups(regions: readonly DirtyCellBounds[]): DirtyCellBo
     const maxPz = Math.min(result.worldPagesZ - 1, Math.floor(dirty.maxZ / span));
     for (let pz = minPz; pz <= maxPz; pz++) {
       for (let px = minPx; px <= maxPx; px++) {
-        const key = `${px >> 1},${pz >> 1}`;
+        const parentX = px >> 1;
+        const parentZ = pz >> 1;
+        const clipped = intersectDirty(dirty, parentGroupFootprint(parentX, parentZ));
+        if (!clipped) continue;
+        const key = `${parentX},${parentZ}`;
         const previous = groups.get(key);
-        groups.set(key, previous ? mergeDirty(previous, dirty) : { ...dirty });
+        groups.set(key, previous ? mergeDirty(previous, clipped) : clipped);
       }
     }
   }
@@ -326,7 +526,9 @@ function postLod0Rebuild(requestIds: number[], dirtyRegions: readonly DirtyCellB
 
   const lod0 = rebuildDirtyRegionGroups(dirtyRegions);
   enqueueParentsForLod0(lod0.dirtyCoords);
-  if (pendingParentCount() > 0 && activeParentRequestId === null) activeParentRequestId = requestIds[0]!;
+  const pendingParents = pendingParentCount();
+  if (pendingParents > 0 && activeParentRequestId === null) activeParentRequestId = requestIds[0]!;
+  if (pendingParents > 0) scheduleParentDrain();
 
   const tSer = performance.now();
   const lod0Serialized = serializeNodes(lod0.changed);
@@ -354,16 +556,24 @@ function postLod0Rebuild(requestIds: number[], dirtyRegions: readonly DirtyCellB
     serializedBytes,
     chunksRemeshed: lod0.chunksRemeshed,
     chunksTotal: lod0.chunksTotal,
-    pendingParents: pendingParentCount(),
+    pendingParents,
   }, transferables);
-
-  if (pendingParentCount() > 0) scheduleParentDrain();
 }
 
 function handleDig(request: Extract<ClodWorkerRequest, { type: "dig" }>): void {
   if (!result || !cfg || !index) throw new Error("CLOD worker received a dig before build completion");
-  for (const edit of request.edits) addDigEdit(edit);
-  postLod0Rebuild([request.requestId], request.dirtyRegions, request.edits.length);
+  const previousEdits = getDigEditsSnapshot();
+  const lod0Snapshot = snapshotLod0Nodes(request.dirtyRegions);
+  const parentQueueSnapshot = snapshotParentQueue();
+  try {
+    for (const edit of request.edits) addDigEdit(edit);
+    postLod0Rebuild([request.requestId], request.dirtyRegions, request.edits.length);
+  } catch (error) {
+    replaceDigEdits(previousEdits);
+    restoreLod0Nodes(lod0Snapshot);
+    restoreParentQueue(parentQueueSnapshot);
+    throw error;
+  }
 }
 
 function handleFlush(request: Extract<ClodWorkerRequest, { type: "flush" }>): void {

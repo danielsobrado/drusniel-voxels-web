@@ -16,6 +16,8 @@ import { compressPayload, decompressPayload, resolveCompressionMode } from "./co
 import { sha256Hex } from "./checksum.js";
 import {
   CacheChecksumError,
+  CacheCorruptError,
+  CacheDecodeError,
   CacheUnavailableError,
 } from "./cacheErrors.js";
 import { cacheLogger } from "./cacheLogger.js";
@@ -46,6 +48,12 @@ export interface ClodCacheService {
 
 function miss<T>(key: string, reason: CacheMissReason, decodeMs = 0): ClodCacheGetResult<T> {
   return { status: "miss", reason, key, bytesRead: 0, decodeMs };
+}
+
+function isArtifactValidationError(error: unknown): boolean {
+  return error instanceof CacheCorruptError
+    || error instanceof CacheDecodeError
+    || error instanceof CacheChecksumError;
 }
 
 export class ClodCacheServiceImpl implements ClodCacheService {
@@ -203,6 +211,9 @@ export class ClodCacheServiceImpl implements ClodCacheService {
         cacheLogger.warn(`get failed for ${key} [${name}] ${message}`);
         this.metrics.recordMiss(reason);
         this.metrics.recordError(`[${name}] ${message}`);
+        if (isArtifactValidationError(error)) {
+          void this.delete(keyParts);
+        }
         if (reason === "backend-error") this.notePersistentError();
         if (this.config.strict) throw error;
         return miss<TArtifact>(key, reason, performance.now() - t0);
@@ -280,7 +291,9 @@ export class ClodCacheServiceImpl implements ClodCacheService {
         const message = error instanceof Error ? error.message : String(error);
         cacheLogger.error(`put failed for ${key} [${name}] ${message}`);
         this.metrics.recordError(`[${name}] ${message}`);
-        this.notePersistentError();
+        if (error instanceof CacheUnavailableError || error instanceof DOMException) {
+          this.notePersistentError();
+        }
         if (this.config.strict) throw error;
         return { key, bytesWritten: 0, encodeMs: performance.now() - t0, compression: "none" };
       }
@@ -334,8 +347,18 @@ export class ClodCacheServiceImpl implements ClodCacheService {
     keyParts: ClodCacheKeyParts,
   ): CacheMissReason | null {
     if (header.schemaVersion !== this.config.schema_version) return "schema-mismatch";
+    if (header.artifactKind !== keyParts.artifactKind) return "schema-mismatch";
     if (this.config.invalidation.include_builder_version && header.builderVersion !== keyParts.builderVersion) {
       return "builder-version-mismatch";
+    }
+    if (this.config.invalidation.include_generator_version && header.generatorVersion !== keyParts.generatorVersion) {
+      return "generator-version-mismatch";
+    }
+    if (this.config.invalidation.include_world_seed && header.worldSeed !== keyParts.worldSeed) {
+      return "world-seed-mismatch";
+    }
+    if (this.config.invalidation.include_source_revision && header.sourceRevision !== keyParts.sourceRevision) {
+      return "source-revision-mismatch";
     }
     if (this.config.invalidation.include_config_hash && header.configHash !== keyParts.configHash) {
       return "config-hash-mismatch";
