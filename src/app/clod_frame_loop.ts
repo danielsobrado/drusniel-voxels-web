@@ -4,6 +4,7 @@ import { runVegetationFramePhase } from "./frame_loop/vegetation_frame_phase.js"
 import { runStatsSyncPhase } from "./frame_loop/stats_sync_phase.js";
 import { runRenderPhase } from "./frame_loop/render_phase.js";
 import { submitMsChanged } from "./frame_loop/frame_timing.js";
+import { createBorderOceanDebugPanel } from "../water/border_ocean_debug_panel.js";
 export type { ClodFrameLoopUiState } from "./frame_loop/ui_state.js";
 export type { StatsPresenter } from "./frame_loop/stats_presenter.js";
 export type { FrameRenderer } from "./frame_loop/frame_renderer.js";
@@ -21,13 +22,17 @@ export type {
 import type { ClodFrameLoopDeps } from "./frame_loop/frame_loop_deps.js";
 
 export function bindClodFrameLoop(deps: ClodFrameLoopDeps): void {
-  const { render, player, terrain, vegetation, waterWeather, stats, diagnostics, farSummary, shadowProxy, canopy, construction, combat } = deps;
+  const { render, player, terrain, vegetation, waterWeather, stats, diagnostics, farSummary, shadowProxy, clodShadow, canopy, construction, combat, spells } = deps;
   let elapsedSeconds = 0;
   const averageFpsRef = stats.averageFpsRef;
   const fpsSamples: number[] = [];
   let lastFrameAt = performance.now();
   let lastFpsRefreshAt = lastFrameAt;
   let grassProfileFrame = { value: 0 };
+  const debugQuery = new URLSearchParams(window.location.search);
+  const borderOceanDebugPanel = diagnostics.queryScene === "border-ocean" || debugQuery.get("borderOceanDebug") === "1"
+    ? createBorderOceanDebugPanel(document.body)
+    : null;
 
   const updateAverageFps = () => {
     const now = performance.now();
@@ -79,6 +84,7 @@ export function bindClodFrameLoop(deps: ClodFrameLoopDeps): void {
           deepOcean: waterWeather.deepOceanConfig,
           deepOceanMeshPresent: waterWeather.deepOceanMeshPresent,
           oceanSampler: waterWeather.oceanSampler,
+          playerConfig: player.player.config,
         }
       : undefined,
   });
@@ -129,6 +135,7 @@ export function bindClodFrameLoop(deps: ClodFrameLoopDeps): void {
     });
 
     combat?.update(performance.now());
+    spells?.update(performance.now());
 
     const terrainPhase = runTerrainFramePhase({
       state: player.state,
@@ -144,10 +151,14 @@ export function bindClodFrameLoop(deps: ClodFrameLoopDeps): void {
     });
 
     shadowProxy?.rebuildIfNeeded();
+    clodShadow?.update();
+    if (clodShadow?.isActive()) {
+      clodShadow.statsController?.updateDisplay();
+    }
 
     canopy?.update(render.camera.position.x, render.camera.position.z);
 
-    runVegetationFramePhase({
+    const vegetationTiming = runVegetationFramePhase({
       elapsedSeconds,
       playerDelta,
       ringCenter: terrainPhase.ringCenter,
@@ -170,7 +181,19 @@ export function bindClodFrameLoop(deps: ClodFrameLoopDeps): void {
       currentLighting: vegetation.currentLighting,
       selectionFrameId: selectionStats.frameId,
       worldCells: terrain.worldCells,
+      collectTiming: player.state.profileEnabled,
     });
+
+    if (borderOceanDebugPanel && selectionStats.frameId % 10 === 0) {
+      borderOceanDebugPanel.update({
+        worldCells: terrain.worldCells,
+        cameraPosition: render.camera.position,
+        deepOcean: waterWeather.deepOceanConfig,
+        deepOceanMeshPresent: waterWeather.deepOceanMeshPresent,
+        oceanSampler: waterWeather.oceanSampler,
+        playerConfig: player.player.config,
+      });
+    }
 
     const { currentGrassStats } = runStatsSyncPhase({
       state: player.state,
@@ -212,6 +235,7 @@ export function bindClodFrameLoop(deps: ClodFrameLoopDeps): void {
       currentGrassStats,
       tPropsStart: terrainPhase.tPropsStart,
       tBubbleStart: terrainPhase.tBubbleStart,
+      vegetationTiming,
       chunkGroupsBuiltThisFrame: terrainPhase.chunkGroupsBuiltThisFrame,
       nearFieldBubbleController: terrain.nearFieldBubbleController,
       interaction: player.interaction,

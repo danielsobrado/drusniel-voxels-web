@@ -13,11 +13,13 @@ import {
   rehydrateBuildResult,
   type ClodWorkerRequest,
   type ClodWorkerResponse,
+  type SerializedClodNode,
   type SerializedHydrologyTerrain,
   type SerializedParentBatch,
 } from "./clod_worker_protocol.js";
 
 const MAX_DIG_EDITS_PER_WORKER_BATCH = 8;
+const WORKER_STOPPED_ERROR = "CLOD worker stopped";
 
 export interface WorkerLod0Rebuild {
   changed: ClodPageNode[];
@@ -51,6 +53,11 @@ interface DigBatchSlot {
   resolvers: Array<PendingRequest<WorkerLod0Rebuild>>;
 }
 
+interface NodeTarget {
+  node: SerializedClodNode;
+  target: ClodPageNode;
+}
+
 export class ClodWorkerClient {
   onParentRebuilt: ((batch: WorkerParentBatch) => void) | null = null;
   onParentsComplete: ((requestId: number | null, parentNodes: number, parentMs: number) => void) | null = null;
@@ -67,21 +74,23 @@ export class ClodWorkerClient {
   private progressHandlers = new Map<number, (progress: BuildProgress) => void>();
   private digPending: DigBatchSlot | null = null;
   private digPumpActive = false;
-  private parentsPending = false;
   private parentsHealthy = true;
   private lastParentError: Error | null = null;
   private parentsWaiters: Array<() => void> = [];
+  private stopped = false;
 
   constructor() {
     attachMainThreadCacheBroker(this.worker);
     this.worker.onmessage = (event: MessageEvent) => {
-      if (isCacheRpcMessage(event.data)) return;
-      this.handleMessage(event.data as ClodWorkerResponse);
+      if (this.stopped || isCacheRpcMessage(event.data)) return;
+      try {
+        this.handleMessage(event.data as ClodWorkerResponse);
+      } catch (error) {
+        this.failClosed(error);
+      }
     };
     this.worker.onerror = (event) => {
-      const error = new Error(event.message || "CLOD worker failed");
-      this.rejectAll(error);
-      this.onError?.(error);
+      this.failClosed(new Error(event.message || "CLOD worker failed"));
     };
   }
 
@@ -96,6 +105,7 @@ export class ClodWorkerClient {
     cacheDisabled = false,
     terrainSource: TerrainSourceInputs,
   ): Promise<BuildResult> {
+    if (this.stopped) return Promise.reject(new Error(WORKER_STOPPED_ERROR));
     const requestId = this.nextRequestId++;
     const request: ClodWorkerRequest = {
       type: "build",
@@ -110,14 +120,18 @@ export class ClodWorkerClient {
       terrainSource,
     };
     this.progressHandlers.set(requestId, onProgress);
-    return new Promise((resolve, reject) => {
-      this.buildRequests.set(requestId, { resolve, reject });
-      this.worker.postMessage(request);
+    return this.postTrackedRequest(this.buildRequests, request).catch((error) => {
+      this.progressHandlers.delete(requestId);
+      throw error;
     });
   }
 
   rebuildAfterDig(edit: DigEdit, dirty: DirtyCellBounds): Promise<WorkerLod0Rebuild> {
     return new Promise((resolve, reject) => {
+      if (this.stopped) {
+        reject(new Error(WORKER_STOPPED_ERROR));
+        return;
+      }
       if (!this.digPending) {
         this.digPending = {
           edits: [edit],
@@ -134,21 +148,17 @@ export class ClodWorkerClient {
   }
 
   flushParents(): Promise<void> {
+    if (this.stopped) return Promise.reject(new Error(WORKER_STOPPED_ERROR));
     const requestId = this.nextRequestId++;
     const request: ClodWorkerRequest = { type: "flush", requestId };
-    return new Promise((resolve, reject) => {
-      this.flushRequests.set(requestId, { resolve, reject });
-      this.worker.postMessage(request);
-    });
+    return this.postTrackedRequest(this.flushRequests, request);
   }
 
   clearCache(): Promise<void> {
+    if (this.stopped) return Promise.reject(new Error(WORKER_STOPPED_ERROR));
     const requestId = this.nextRequestId++;
     const request: ClodWorkerRequest = { type: "clearCache", requestId };
-    return new Promise((resolve, reject) => {
-      this.clearCacheRequests.set(requestId, { resolve, reject });
-      this.worker.postMessage(request);
-    });
+    return this.postTrackedRequest(this.clearCacheRequests, request);
   }
 
   isParentsHealthy(): boolean {
@@ -160,15 +170,29 @@ export class ClodWorkerClient {
   }
 
   dispose(): void {
+    if (this.stopped) return;
+    this.stopped = true;
     this.worker.terminate();
     this.rejectAll(new Error("CLOD worker disposed"));
   }
 
+  private postTrackedRequest<T>(requests: Map<number, PendingRequest<T>>, request: ClodWorkerRequest): Promise<T> {
+    return new Promise((resolve, reject) => {
+      requests.set(request.requestId, { resolve, reject });
+      try {
+        this.worker.postMessage(request);
+      } catch (error) {
+        requests.delete(request.requestId);
+        reject(error);
+      }
+    });
+  }
+
   private async pumpDigQueue(): Promise<void> {
-    if (this.digPumpActive) return;
+    if (this.digPumpActive || this.stopped) return;
     this.digPumpActive = true;
     try {
-      while (this.digPending) {
+      while (this.digPending && !this.stopped) {
         const batch = this.digPending;
         this.digPending = null;
         for (const part of this.splitDigBatch(batch)) {
@@ -178,11 +202,15 @@ export class ClodWorkerClient {
           } catch (error) {
             for (const pending of part.resolvers) pending.reject(error);
           }
+          if (this.stopped) break;
         }
       }
     } finally {
       this.digPumpActive = false;
-      if (this.digPending) void this.pumpDigQueue();
+      if (this.digPending) {
+        if (this.stopped) this.rejectPendingDig(new Error(WORKER_STOPPED_ERROR));
+        else void this.pumpDigQueue();
+      }
     }
   }
 
@@ -201,18 +229,31 @@ export class ClodWorkerClient {
   }
 
   private sendDigBatch(batch: DigBatchSlot): Promise<WorkerLod0Rebuild> {
+    if (this.stopped) return Promise.reject(new Error(WORKER_STOPPED_ERROR));
     const requestId = this.nextRequestId++;
     const request: ClodWorkerRequest = { type: "dig", requestId, edits: batch.edits, dirtyRegions: batch.dirtyRegions };
-    return new Promise((resolve, reject) => {
-      this.digRequests.set(requestId, { resolve, reject });
-      this.worker.postMessage(request);
-    });
+    return this.postTrackedRequest(this.digRequests, request);
   }
 
   private resolveParentsWaiters(): void {
-    this.parentsPending = false;
     for (const resolve of this.parentsWaiters) resolve();
     this.parentsWaiters = [];
+  }
+
+  private collectNodeTargets(nodes: readonly SerializedClodNode[]): NodeTarget[] {
+    const targets = nodes.map((node) => {
+      const target = this.nodesById.get(node.id);
+      if (!target) throw new Error(`CLOD worker returned unknown node ${node.id}`);
+      return { node, target };
+    });
+    for (const { node } of targets) {
+      for (const childId of node.childIds) {
+        if (childId !== null && !this.nodesById.has(childId)) {
+          throw new Error(`CLOD worker returned node ${node.id} with unknown child ${childId}`);
+        }
+      }
+    }
+    return targets;
   }
 
   private handleMessage(message: ClodWorkerResponse): void {
@@ -226,21 +267,20 @@ export class ClodWorkerClient {
       case "buildComplete": {
         const pending = this.buildRequests.get(message.requestId);
         if (!pending) break;
+        const nextResult = rehydrateBuildResult(message.result);
+        const nextNodesById = indexNodes(nextResult);
+        setWorkerCacheSnapshot(message.cacheBuildStats ?? null, message.cacheServiceMetrics ?? null);
+        this.result = nextResult;
+        this.nodesById = nextNodesById;
         this.buildRequests.delete(message.requestId);
         this.progressHandlers.delete(message.requestId);
-        this.result = rehydrateBuildResult(message.result);
-        this.nodesById = indexNodes(this.result);
-        setWorkerCacheSnapshot(message.cacheBuildStats ?? null, message.cacheServiceMetrics ?? null);
         pending.resolve(this.result);
         break;
       }
       case "lod0Rebuilt": {
+        const targets = this.collectNodeTargets(message.changed);
         const result: WorkerLod0Rebuild = {
-          changed: message.changed.map((node) => {
-            const target = this.nodesById.get(node.id);
-            if (!target) throw new Error(`CLOD worker returned unknown node ${node.id}`);
-            return applySerializedNode(target, node, this.nodesById);
-          }),
+          changed: targets.map(({ node, target }) => applySerializedNode(target, node, this.nodesById)),
           dirtyCoords: message.dirtyCoords,
           lod0Pages: message.lod0Pages,
           lod0Ms: message.lod0Ms,
@@ -251,7 +291,6 @@ export class ClodWorkerClient {
           pendingParents: message.pendingParents,
           requestCount: message.editCount,
         };
-        if (message.pendingParents > 0) this.parentsPending = true;
         for (const rid of message.requestIds) {
           const pending = this.digRequests.get(rid);
           if (pending) {
@@ -261,9 +300,11 @@ export class ClodWorkerClient {
         }
         break;
       }
-      case "parentRebuilt":
-        this.onParentRebuilt?.(this.rehydrateParentBatch(message));
+      case "parentRebuilt": {
+        const batch = this.rehydrateParentBatch(message);
+        this.onParentRebuilt?.(batch);
         break;
+      }
       case "parentsComplete":
         this.parentsHealthy = true;
         this.lastParentError = null;
@@ -292,25 +333,34 @@ export class ClodWorkerClient {
   }
 
   private rehydrateParentBatch(message: SerializedParentBatch): WorkerParentBatch {
+    const targets = this.collectNodeTargets(message.changed);
     return {
       requestId: message.requestId,
-      changed: message.changed.map((node) => {
-        const target = this.nodesById.get(node.id);
-        if (!target) throw new Error(`CLOD worker returned unknown node ${node.id}`);
-        return applySerializedNode(target, node, this.nodesById);
-      }),
+      changed: targets.map(({ node, target }) => applySerializedNode(target, node, this.nodesById)),
       parentNodes: message.parentNodes,
       parentMs: message.parentMs,
       pendingParents: message.pendingParents,
     };
   }
 
-  private releaseParentsWaitersAfterFailure(error: Error): void {
-    this.parentsPending = false;
+  private failClosed(error: unknown): void {
+    if (this.stopped) return;
+    const err = error instanceof Error ? error : new Error(String(error));
+    this.stopped = true;
+    this.worker.terminate();
+    this.markParentsFailed(err);
+    this.rejectAll(err);
+    this.onError?.(err);
+  }
+
+  private markParentsFailed(error: Error): void {
     this.parentsHealthy = false;
     this.lastParentError = error;
-    for (const resolve of this.parentsWaiters) resolve();
-    this.parentsWaiters = [];
+    this.resolveParentsWaiters();
+  }
+
+  private releaseParentsWaitersAfterFailure(error: Error): void {
+    this.markParentsFailed(error);
     this.onError?.(error);
   }
 
@@ -333,7 +383,15 @@ export class ClodWorkerClient {
     this.releaseParentsWaitersAfterFailure(error);
   }
 
+  private rejectPendingDig(error: Error): void {
+    const pending = this.digPending;
+    this.digPending = null;
+    if (!pending) return;
+    for (const resolver of pending.resolvers) resolver.reject(error);
+  }
+
   private rejectAll(error: Error): void {
+    this.rejectPendingDig(error);
     for (const pending of this.buildRequests.values()) pending.reject(error);
     for (const pending of this.digRequests.values()) pending.reject(error);
     for (const pending of this.flushRequests.values()) pending.reject(error);

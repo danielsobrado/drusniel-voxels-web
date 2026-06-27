@@ -3,7 +3,7 @@
   left: 50%;
   bottom: 80px;
   z-index: 13;
-  display: none;
+  display: flex;
   align-items: center;
   gap: 7px;
   padding: 7px 9px;
@@ -22,20 +22,16 @@
   touch-action: none;
 }
 
-#spell-menu.visible {
-  display: flex;
+body[data-player-mode="choosingSpawn"] #spell-menu {
+  display: none;
 }
 
-body[data-player-mode="choosingSpawn"] #spell-menu.visible {
-  display: flex !important;
+#spell-menu.spell-menu-hidden {
+  display: none !important;
 }
 
 #spell-menu.dragging {
   transition: none;
-}
-
-.spell-menu-hidden {
-  display: none !important;
 }
 
 .spell-menu-title {
@@ -93,44 +89,6 @@ body[data-player-mode="choosingSpawn"] #spell-menu.visible {
   box-shadow:
     0 0 14px rgba(255, 112, 36, 0.38),
     inset 0 1px 0 rgba(255, 247, 207, 0.2);
-}
-
-.spell-vfx-layer {
-  position: fixed;
-  left: 50%;
-  bottom: 28px;
-  z-index: 10;
-  width: min(560px, calc(100vw - 28px));
-  height: 320px;
-  transform: translateX(-50%);
-  pointer-events: none;
-  opacity: 0;
-  transition: opacity 120ms linear;
-}
-
-.spell-vfx-layer[data-active="true"] {
-  opacity: 1;
-}
-
-.spell-vfx-canvas {
-  display: block;
-  width: 100%;
-  height: 100%;
-}
-
-.spell-vfx-layer[data-fallback="true"]::before {
-  content: "";
-  position: absolute;
-  left: 50%;
-  bottom: 24px;
-  width: 58%;
-  height: 76%;
-  transform: translateX(-50%);
-  background:
-    radial-gradient(ellipse at 50% 84%, rgba(255, 244, 170, 0.88), transparent 18%),
-    radial-gradient(ellipse at 50% 68%, rgba(255, 132, 38, 0.72), transparent 44%),
-    radial-gradient(ellipse at 50% 52%, rgba(170, 31, 16, 0.5), transparent 68%);
-  filter: blur(4px);
 }
 
 @media (max-width: 760px) {

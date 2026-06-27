@@ -1,24 +1,27 @@
-import { FireFlameRenderer } from "./fire_flame_renderer.js";
-import { FlameSfx } from "./flame_sfx.js";
+import { emitAudio } from "../audio/index.js";
 import { defaultSpellConfig, type SpellConfig } from "./spell_config.js";
+import type { SpellVfxController } from "./spell_vfx_controller.js";
 
 export interface SpellMenu {
   castFire: () => void;
+  castWater: () => void;
   dispose: () => void;
 }
 
 export interface SpellMenuDeps {
   config?: SpellConfig;
   root?: HTMLElement;
+  /** In-scene VFX controller that plays the 3D fire/water billboards. */
+  controller?: SpellVfxController;
 }
 
 export function createSpellMenu(deps: SpellMenuDeps = {}): SpellMenu {
   const config = deps.config ?? defaultSpellConfig;
   const root = deps.root ?? ensureMenuRoot(config.menu.rootId);
   const shouldRemoveRoot = deps.root === undefined;
-  const fireRenderer = new FireFlameRenderer(config.fire.vfx);
-  const flameSfx = new FlameSfx();
-  let activeReset = 0;
+  const controller = deps.controller;
+  let fireActiveReset = 0;
+  let waterActiveReset = 0;
   let dragOffset: { x: number; y: number } | null = null;
 
   root.replaceChildren();
@@ -31,17 +34,12 @@ export function createSpellMenu(deps: SpellMenuDeps = {}): SpellMenu {
   const slots = document.createElement("div");
   slots.className = "spell-menu-slots";
 
-  const fireButton = document.createElement("button");
-  const onFireButtonClick = (): void => castFire();
-  fireButton.type = "button";
-  fireButton.textContent = `🔥 ${config.fire.label}`;
-  fireButton.title = `${config.fire.label} spell`;
-  fireButton.setAttribute("aria-pressed", "false");
-  fireButton.addEventListener("click", onFireButtonClick);
+  const fireButton = createSpellButton(`1 🔥 ${config.fire.label}`, `${config.fire.label} spell (1)`, () => castFire());
+  const waterButton = createSpellButton(`2 💧 ${config.water.label}`, `${config.water.label} spell (2)`, () => castWater());
 
   root.addEventListener("pointerdown", stopUiPropagation);
   root.addEventListener("click", stopUiPropagation);
-  slots.appendChild(fireButton);
+  slots.append(fireButton, waterButton);
   root.append(title, slots);
 
   title.addEventListener("pointerdown", onDragStart);
@@ -75,31 +73,59 @@ export function createSpellMenu(deps: SpellMenuDeps = {}): SpellMenu {
   }
 
   function castFire(): void {
-    window.clearTimeout(activeReset);
+    window.clearTimeout(fireActiveReset);
     fireButton.setAttribute("aria-pressed", "true");
-    fireRenderer.play(config.fire.castDurationMs);
-    flameSfx.play(config.fire.audio, config.fire.castDurationMs);
-    activeReset = window.setTimeout(() => {
+    controller?.playFire(config.fire.castDurationMs);
+    emitAudio("spell.fire.cast", {
+      volume: config.fire.audio.volume,
+      durationMs: config.fire.castDurationMs,
+    });
+    fireActiveReset = window.setTimeout(() => {
       fireButton.setAttribute("aria-pressed", "false");
     }, config.fire.castDurationMs);
   }
 
+  function castWater(): void {
+    window.clearTimeout(waterActiveReset);
+    waterButton.setAttribute("aria-pressed", "true");
+    controller?.playWater(config.water.castDurationMs);
+    emitAudio("spell.water.cast", {
+      volume: config.water.audio.volume,
+      durationMs: config.water.castDurationMs,
+    });
+    waterActiveReset = window.setTimeout(() => {
+      waterButton.setAttribute("aria-pressed", "false");
+    }, config.water.castDurationMs);
+  }
+
   return {
     castFire,
+    castWater,
     dispose: () => {
-      window.clearTimeout(activeReset);
-      activeReset = 0;
+      window.clearTimeout(fireActiveReset);
+      window.clearTimeout(waterActiveReset);
+      fireActiveReset = 0;
+      waterActiveReset = 0;
       if (dragOffset) onDragEnd();
       title.removeEventListener("pointerdown", onDragStart);
       root.removeEventListener("pointerdown", stopUiPropagation);
       root.removeEventListener("click", stopUiPropagation);
-      fireButton.removeEventListener("click", onFireButtonClick);
-      fireRenderer.dispose();
-      flameSfx.dispose();
+      fireButton.remove();
+      waterButton.remove();
       if (shouldRemoveRoot) root.remove();
       else root.replaceChildren();
     },
   };
+}
+
+function createSpellButton(label: string, title: string, onClick: () => void): HTMLButtonElement {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = label;
+  button.title = title;
+  button.setAttribute("aria-pressed", "false");
+  button.addEventListener("click", onClick);
+  return button;
 }
 
 function ensureMenuRoot(rootId: string): HTMLElement {

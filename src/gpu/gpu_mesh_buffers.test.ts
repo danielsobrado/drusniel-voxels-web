@@ -2,7 +2,8 @@
 // (a byte-offset mismatch silently feeds the GPU garbage), and that assembling readback arrays
 // reproduces the canonical surface end-to-end.
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach } from "vitest";
+import { voxelEditStore } from "../terrain/voxel_edits/voxel_edit_store.js";
 import {
   Y_CELLS,
   DIG_EDIT_WORDS,
@@ -84,10 +85,17 @@ describe("packDigEdits", () => {
 });
 
 describe("assembleChunkMesh end-to-end", () => {
+  beforeEach(() => {
+    voxelEditStore.clear();
+  });
+
   it("reproduces the canonical surface from max-sized readback arrays", () => {
     const S = 4;
     const world = { cellsX: 16, cellsZ: 16 };
-    const cfg = { page: { chunk_size: S } } as unknown as ClodPagesConfig;
+    const cfg = {
+      page: { chunk_size: S },
+      simplify: { weld_epsilon_cells: 0.3 },
+    } as unknown as ClodPagesConfig;
     // The GPU writes compact verts/indices into oversized buffers; emulate that with the verified
     // mesher and over-allocated backing arrays, then assemble by the reported counts.
     const gpu = meshChunkGpuShaped(1, 1, S, world, []);
