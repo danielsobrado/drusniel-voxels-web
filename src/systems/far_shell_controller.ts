@@ -5,6 +5,7 @@ import { buildFarCanopyShell } from "../gpu/far_canopy_shell.js";
 import { buildFarTerrainShell, type FarHeightProvider } from "../gpu/far_terrain_shell.js";
 import { FAR_SHELL_DEFAULTS } from "../app/clod_constants.js";
 import type { EnvironmentLighting } from "../environment/environment.js";
+import { updateFarTerrainMaterialCenter } from "../farTerrain/farTerrainMaterial.js";
 
 export interface FarShellInstance {
   mesh: THREE.Mesh;
@@ -36,10 +37,9 @@ export interface FarShellControllerDeps {
   heightProvider?: FarHeightProvider;
   centerX?: number;
   centerZ?: number;
-  /** Override the shell far radius in world units. When set, the shell radius is
-   *  this value instead of worldSizeCells * radiusFactor. */
+  cameraRelativeInnerRadiusM?: number;
+  requireCameraRelativeInnerRadius?: boolean;
   farShellRadiusM?: number;
-  /** When true, legacy procedural canopy is not built (Phase 8 deterministic system owns canopy). */
   skipLegacyCanopy?: boolean;
 }
 
@@ -50,9 +50,7 @@ export interface FarShellController {
   readonly canopyShell: FarShellInstance | null;
   dispose(): void;
   moveTo(x: number, z: number): void;
-  /** Set or change the height provider after construction. Rebuilds the shell. */
   setHeightProvider(provider: FarHeightProvider | undefined): void;
-  /** Override the shell far radius (world units). Pass 0 to clear the override. */
   setFarRadiusOverride(m: number): void;
 }
 
@@ -66,12 +64,31 @@ export function createFarShellController(deps: FarShellControllerDeps): FarShell
   let buildCenterX = currentCenterX;
   let buildCenterZ = currentCenterZ;
 
+  const parityMaterialEnabled = (): boolean => Boolean(deps.useParityMaterial?.() && deps.getParityConfig?.());
+
+  const syncParityMaterialCenter = (mesh: THREE.Mesh, x: number, z: number): void => {
+    if (!parityMaterialEnabled()) return;
+    if (Array.isArray(mesh.material)) return;
+    updateFarTerrainMaterialCenter(mesh.material as import("three/webgpu").MeshBasicNodeMaterial, x, z);
+  };
+
   const resolveFarRadius = (radiusFactor: number): number =>
     currentFarRadiusOverride && currentFarRadiusOverride > 0
       ? currentFarRadiusOverride
       : deps.farShellRadiusM && deps.farShellRadiusM > 0
         ? deps.farShellRadiusM
         : deps.worldSizeCells * radiusFactor;
+
+  const resolveInnerExclusionRadius = (farRadius: number): number | undefined => {
+    if (!currentHeightProvider) return undefined;
+    const configured = deps.cameraRelativeInnerRadiusM;
+    if (deps.requireCameraRelativeInnerRadius && (!configured || configured <= 0)) {
+      throw new Error("Missing camera-relative far shell inner radius");
+    }
+    const fallback = deps.worldSizeCells / 2;
+    const radius = configured && configured > 0 ? configured : fallback;
+    return Math.max(0, Math.min(radius, farRadius * 0.95));
+  };
 
   const buildFarShellInstance = (
     radiusFactor: number,
@@ -98,17 +115,18 @@ export function createFarShellController(deps: FarShellControllerDeps): FarShell
       heightProvider: currentHeightProvider,
       centerX: currentCenterX,
       centerZ: currentCenterZ,
+      innerExclusionRadius: resolveInnerExclusionRadius(farRadius),
       buildRelative: useRelativeBuild,
       receiveSunShadows: deps.receiveSunShadows?.() ?? false,
       useDebugLambertReceiver: deps.useDebugLambertReceiver?.() ?? false,
-      useParityMaterial: deps.useParityMaterial?.() ?? false,
+      useParityMaterial: parityMaterialEnabled(),
       parityConfig: deps.getParityConfig?.(),
     });
     buildCenterX = result.buildCenterX;
     buildCenterZ = result.buildCenterZ;
-    // For relative build, translate to the actual world center
     if (useRelativeBuild) {
       result.mesh.position.set(currentCenterX, 0, currentCenterZ);
+      syncParityMaterialCenter(result.mesh, currentCenterX, currentCenterZ);
     }
     current = result;
     deps.scene.add(result.mesh);
@@ -127,9 +145,8 @@ export function createFarShellController(deps: FarShellControllerDeps): FarShell
 
   const moveTo = (x: number, z: number) => {
     if (!current) return;
-    // For relative builds, just translate the mesh.
-    // For non-relative, delta-move (only valid for small offsets).
     current.mesh.position.set(x - buildCenterX, 0, z - buildCenterZ);
+    syncParityMaterialCenter(current.mesh, x, z);
     currentCenterX = x;
     currentCenterZ = z;
   };

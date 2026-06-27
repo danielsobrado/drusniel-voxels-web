@@ -14,6 +14,7 @@ import {
 import { defaultWaterDebugState } from "../../water/waterDebug.js";
 import type { HydrologySystem } from "../../water/hydrologySystem.js";
 import { createWaterShaderMaterial } from "../../water/waterMaterial.js";
+import { RiverBankResidueOverlay } from "../../water/riverBankResidueOverlay.js";
 
 export interface WaterControllerUiState {
   waterEnabled: boolean;
@@ -93,14 +94,13 @@ function readShoreSurfSettings(
         maxShallowDepth: Math.min(2.5, borderCoast.ocean.minDepth),
       }
     : {};
-  const deepOceanOwnsBorder = Boolean(borderCoast?.enabled && borderCoast.deepOcean.enabled);
   const urlEnabled = searchParams.get("shoreSurf") === "1" || searchParams.get("edgeOcean") === "1";
   const urlDisabled = searchParams.get("shoreSurf") === "0" || searchParams.get("edgeOcean") === "0";
-  const legacySurfEnabled = Boolean(fromBorder.enabled) && !deepOceanOwnsBorder;
+  const surfEnabled = Boolean(fromBorder.enabled);
   return {
     ...DEFAULT_SHORE_SURF_BAND_SETTINGS,
     ...fromBorder,
-    enabled: !urlDisabled && (urlEnabled || legacySurfEnabled),
+    enabled: !urlDisabled && (urlEnabled || surfEnabled),
     startDistance: readPositiveParam(
       searchParams,
       "oceanStart",
@@ -150,8 +150,10 @@ export async function createWaterController(deps: WaterControllerDeps): Promise<
     cameraPosition: deps.camera.position as THREE.Vector3,
     worldBounds: { cellsX: deps.worldCells, cellsZ: deps.worldCells },
   });
+  const residueOverlay = new RiverBankResidueOverlay(deps.scene, field);
   const ui = deps.getUiState();
   clipmap.setVisible(ui.waterEnabled);
+  residueOverlay.setVisible(ui.waterEnabled);
   clipmap.setClipmapTint(ui.waterClipmapTint);
   clipmap.setWireframe(ui.waterWireframe);
   assertPageMeshSignaturesUnchanged(pageSignaturesBefore, pageMeshSignatures(deps.nodes));
@@ -196,6 +198,7 @@ export async function createWaterController(deps: WaterControllerDeps): Promise<
     makeVisual,
     setVisible(enabled) {
       clipmap.setVisible(enabled);
+      residueOverlay.setVisible(enabled);
     },
     setDebugMode(mode) {
       clipmap.setDebugMode(WATER_DEBUG_MODES[mode]);
@@ -230,6 +233,7 @@ export async function createWaterController(deps: WaterControllerDeps): Promise<
     },
     update(deltaSeconds, cameraPosition) {
       clipmap.update(deltaSeconds, cameraPosition);
+      residueOverlay.update(deltaSeconds, cameraPosition);
     },
     installDebugApi(hooks) {
       const enabled = deps.devMode || deps.searchParams.get("waterDebug") === "1" || deps.searchParams.get("debug") === "1";
@@ -311,6 +315,7 @@ export async function createWaterController(deps: WaterControllerDeps): Promise<
           shoreSurf: field.getShoreSurfBand(),
           clipmapExclusionBand: field.getClipmapExclusionBand(),
           debugModes: { ...WATER_DEBUG_MODES },
+          residueOverlay: true,
           clipmap: {
             levelCount: clipmap.levelCount,
             levels: Array.from({ length: clipmap.levelCount }, (_, index) => clipmap.getLevelRect(index)),
@@ -378,6 +383,7 @@ export async function createWaterController(deps: WaterControllerDeps): Promise<
       });
     },
     dispose() {
+      residueOverlay.dispose();
       clipmap.dispose();
     },
   };

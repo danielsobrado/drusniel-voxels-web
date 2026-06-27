@@ -1,6 +1,14 @@
+import * as THREE from "three";
 import { describe, expect, it } from "vitest";
-import { computeFarTerrainVertexColors, createVertexColorBuffer } from "./farTerrainMaterial.js";
+import {
+  computeFarTerrainVertexColors,
+  createFarTerrainMaterial,
+  createVertexColorBuffer,
+  updateFarTerrainMaterialSummaryAtlas,
+  type FarTerrainUniformRefs,
+} from "./farTerrainMaterial.js";
 import type { FarTerrainUniformData } from "./farTerrainUniforms.js";
+import type { FarSummaryGpuAtlasView } from "../naadf/gpu/farSummaryAtlas.js";
 
 function makeUniformData(overrides: Partial<FarTerrainUniformData> = {}): FarTerrainUniformData {
   return {
@@ -48,6 +56,45 @@ function makeUniformData(overrides: Partial<FarTerrainUniformData> = {}): FarTer
   };
 }
 
+function makeLighting() {
+  return {
+    sunDirection: new THREE.Vector3(0, 1, 0),
+    sunColor: new THREE.Color(1, 1, 1),
+    skyLight: new THREE.Color(1, 1, 1),
+    groundLight: new THREE.Color(0.2, 0.2, 0.2),
+  };
+}
+
+function makeSummaryAtlas(ringCount: number): FarSummaryGpuAtlasView {
+  const widthCells = 4;
+  const ringHeightCells = 4;
+  const heightCells = ringHeightCells * ringCount;
+  const texture = new THREE.DataTexture(new Float32Array(widthCells * heightCells * 4), widthCells, heightCells, THREE.RGBAFormat, THREE.FloatType);
+  const materialTexture = new THREE.DataTexture(new Float32Array(widthCells * heightCells * 4), widthCells, heightCells, THREE.RGBAFormat, THREE.FloatType);
+  return {
+    texture,
+    materialTexture,
+    rings: Array.from({ length: ringCount }, (_, i) => ({
+      originX: i * 100,
+      originZ: i * 200,
+      cellM: 32 + i,
+      startM: i * 1000,
+      endM: (i + 1) * 1000,
+      rowOffsetCells: i * ringHeightCells,
+      widthCells,
+      heightCells: ringHeightCells,
+      valid: 1,
+    })),
+    originX: 0,
+    originZ: 0,
+    cellM: 32,
+    widthCells,
+    heightCells,
+    valid: 1,
+    revision: 0,
+  };
+}
+
 function makePositions(count: number, scale = 100): Float32Array {
   const p = new Float32Array(count * 3);
   for (let i = 0; i < count; i++) {
@@ -67,6 +114,56 @@ function makeNormals(count: number): Float32Array {
   }
   return n;
 }
+
+describe("createFarTerrainMaterial", () => {
+  it("enables vertex colors for far shell parity shading", () => {
+    const material = createFarTerrainMaterial(makeLighting(), makeUniformData(), 0, 0, 1024);
+
+    expect(material.vertexColors).toBe(true);
+    material.dispose();
+  });
+
+  it("creates GPU summary uniforms for every configured atlas ring", () => {
+    const atlas = makeSummaryAtlas(9);
+    const material = createFarTerrainMaterial(makeLighting(), makeUniformData(), 0, 0, 1024, {
+      gpuDisplacement: true,
+      summaryAtlas: atlas,
+    });
+    const refs = material.userData.farTerrainUniforms as FarTerrainUniformRefs;
+
+    expect(refs.uSummaryRings).toHaveLength(9);
+    expect(refs.uSummaryRings?.[8]?.uOriginX.value).toBe(800);
+    material.dispose();
+    atlas.texture.dispose();
+    atlas.materialTexture.dispose();
+  });
+
+  it("updates all GPU summary ring uniforms from the latest atlas view", () => {
+    const first = makeSummaryAtlas(2);
+    const material = createFarTerrainMaterial(makeLighting(), makeUniformData(), 0, 0, 1024, {
+      gpuDisplacement: true,
+      summaryAtlas: first,
+    });
+    const next = makeSummaryAtlas(2);
+    next.valid = 0;
+    next.rings[1]!.originX = 777;
+    next.rings[1]!.rowOffsetCells = 123;
+    next.rings[1]!.valid = 0;
+
+    updateFarTerrainMaterialSummaryAtlas(material, next);
+
+    const refs = material.userData.farTerrainUniforms as FarTerrainUniformRefs;
+    expect(refs.uSummaryValid?.value).toBe(0);
+    expect(refs.uSummaryRings?.[1]?.uOriginX.value).toBe(777);
+    expect(refs.uSummaryRings?.[1]?.uRowOffsetCells.value).toBe(123);
+    expect(refs.uSummaryRings?.[1]?.uValid.value).toBe(0);
+    material.dispose();
+    first.texture.dispose();
+    first.materialTexture.dispose();
+    next.texture.dispose();
+    next.materialTexture.dispose();
+  });
+});
 
 describe("computeFarTerrainVertexColors", () => {
   it("returns valid output for a simple grid", () => {
@@ -155,6 +252,22 @@ describe("createVertexColorBuffer", () => {
     const buf = createVertexColorBuffer(vc, cfg);
 
     expect(buf.length).toBe(9 * 3);
+  });
+
+  it("debugShowFarNormals uses the provided normal buffer", () => {
+    const pos = makePositions(1);
+    const norm = new Float32Array([1, 0, 0]);
+    const cfg = makeUniformData({ debugShowFarNormals: 1 });
+    const vc = computeFarTerrainVertexColors(pos, norm, 1, cfg);
+    const fallback = createVertexColorBuffer(vc, cfg);
+    const actual = createVertexColorBuffer(vc, cfg, norm);
+
+    expect(fallback[0]).toBeCloseTo(0.5, 5);
+    expect(fallback[1]).toBeCloseTo(0.5, 5);
+    expect(fallback[2]).toBeCloseTo(0.75, 5);
+    expect(actual[0]).toBeCloseTo(1.0, 5);
+    expect(actual[1]).toBeCloseTo(0.5, 5);
+    expect(actual[2]).toBeCloseTo(0.5, 5);
   });
 
   it("debugShowFarNormals shows normal-map colors", () => {

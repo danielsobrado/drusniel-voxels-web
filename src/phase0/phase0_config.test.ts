@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, it, expect } from "vitest";
 import { parsePhase0Config } from "./phase0_config.js";
+import { applyOwnershipToFarShellRange, resolveStreamingOwnership } from "../streaming/streaming_ownership.js";
 
 const VALID_YAML = `
 phase0:
@@ -56,6 +57,32 @@ describe("parsePhase0Config", () => {
     expect(cfg.phase0.scenes["infinite_stream"].simulated_streaming_only).toBe(true);
     expect(cfg.metrics.required_counters).toEqual(["world_cells", "target_visible_m", "visible_target_met"]);
     expect(cfg.acceptance.allow_current_4km_failure).toBe(true);
+  });
+
+  it("resolves ownership radii from phase0 streaming config", () => {
+    const cfg = parsePhase0Config(VALID_YAML);
+    const ownership = resolveStreamingOwnership({
+      streaming: cfg.phase0.streaming,
+      targetVisibleM: cfg.phase0.target_visible_m,
+      targetFutureVisibleM: cfg.phase0.target_future_visible_m,
+      streamingScene: true,
+    });
+    expect(ownership.liveRadiusM).toBe(200);
+    expect(ownership.clodRadiusM).toBe(2048);
+    expect(ownership.farShellInnerM).toBe(2048);
+    expect(ownership.farShellOuterM).toBe(8192);
+  });
+
+  it("applies ownership to far shell ranges", () => {
+    const cfg = parsePhase0Config(VALID_YAML);
+    const ownership = resolveStreamingOwnership({
+      streaming: cfg.phase0.streaming,
+      targetVisibleM: cfg.phase0.target_visible_m,
+      targetFutureVisibleM: cfg.phase0.target_future_visible_m,
+      streamingScene: true,
+    });
+    const range = applyOwnershipToFarShellRange({ startMeters: 1600, endMeters: 4096 }, ownership);
+    expect(range).toEqual({ startMeters: 2048, endMeters: 8192 });
   });
 
   it("rejects missing root", () => {

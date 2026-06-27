@@ -7,7 +7,7 @@ import { parseTreeConfig } from "../../../trees/index.js";
 import { parseUnderstoryConfig } from "../../../understory/index.js";
 import type { BorderCoastOceanConfig } from "../../../terrain/border_coast_config.js";
 import type { WaterConfig } from "../../../water/waterConfig.js";
-import type { HydrologySystem } from "../../../water/index.js";
+import { buildRiverTerrainWetnessMask, type HydrologySystem } from "../../../water/index.js";
 import type { EnvironmentLighting } from "../../../environment/environment.js";
 import { drainVegetationDirty, type VegetationDirtyQueue } from "../../../systems/vegetation_dirty.js";
 import type { ClodHooks } from "../../../core/hooks.js";
@@ -34,6 +34,10 @@ import {
 } from "../custom_props_startup.js";
 import { resolvePropPlacementScene } from "../../../props/prop_placements.js";
 import type { CustomPropsSettings, PropPlacementScene } from "../../../props/prop_types.js";
+import { createConstructionController, defaultConstructionConfig, type ConstructionController } from "../../../construction/index.js";
+import type { VoxelProjectArchiveContents } from "../../../project/voxel_project_archive.js";
+import { propPlacementSceneToProjectProps } from "../../../project/project_props.js";
+import { projectPropEditStore } from "../../../project/prop_edit_store.js";
 
 export type { VegetationStatControllerRefs } from "../../../runtime/vegetation/vegetation_types.js";
 
@@ -55,6 +59,7 @@ export interface RuntimeSystemsStartupInput {
   borderCoastOceanConfig: BorderCoastOceanConfig;
   customPropsConfig: CustomPropsSettings;
   propPlacementScenes: Record<string, PropPlacementScene>;
+  stagedImport: VoxelProjectArchiveContents | null;
   queryGrassRingGrid: number | null;
   queryGrassRingCell: number | null;
   isWebGpu: boolean;
@@ -75,6 +80,7 @@ export interface RuntimeSystemsStartupResult extends VegetationStartupResult, Wa
   updateLighting: () => void;
   drainVegetationDirtyQueue: () => void;
   customProps: CustomPropsStartupResult | null;
+  constructionController: ConstructionController | null;
 }
 
 export async function runRuntimeSystemsStartup(
@@ -98,6 +104,7 @@ export async function runRuntimeSystemsStartup(
     borderCoastOceanConfig,
     customPropsConfig,
     propPlacementScenes,
+    stagedImport,
     queryGrassRingGrid,
     queryGrassRingCell,
     isWebGpu,
@@ -166,6 +173,14 @@ export async function runRuntimeSystemsStartup(
   });
 
   const { waterController } = waterWeather;
+  if (isWebGpu && waterConfig.enabled) {
+    const riverTerrainWetnessMask = buildRiverTerrainWetnessMask({
+      field: waterController.field,
+      worldCells,
+      resolution: Number(searchParams.get("riverWetnessMaskRes") ?? 384),
+    });
+    materialController.setRiverTerrainWetnessMask(riverTerrainWetnessMask);
+  }
 
   const updateLighting = () => {
     skyEnvironment?.updateSettings({
@@ -224,26 +239,54 @@ export async function runRuntimeSystemsStartup(
     });
   };
 
-  const customPropsEnabled = resolveCustomPropsEnabled(searchParams, customPropsConfig);
+  const importedProps = stagedImport?.manifest.props ?? [];
+  const hasImportedProps = importedProps.length > 0;
+  const customPropsEnabled = searchParams.get("customProps") === "0"
+    ? false
+    : hasImportedProps || searchParams.get("propEditor") === "1" || resolveCustomPropsEnabled(searchParams, customPropsConfig);
   let customProps: CustomPropsStartupResult | null = null;
   if (customPropsEnabled) {
     try {
-      const placementScene = resolvePropPlacementScene(
-        searchParams,
-        propPlacementScenes,
-        propPlacementScenes.smoke!,
-      );
+      if (hasImportedProps) {
+        projectPropEditStore.restore(importedProps);
+      } else if (!projectPropEditStore.hasProps()) {
+        const scenePreset = resolvePropPlacementScene(searchParams, propPlacementScenes, propPlacementScenes.smoke!);
+        projectPropEditStore.restore(propPlacementSceneToProjectProps(scenePreset));
+      }
       customProps = await runCustomPropsStartup({
         scene,
         camera,
         customPropsConfig,
-        placementScene,
+        placementScene: projectPropEditStore.toPlacementScene(hasImportedProps ? "archive" : "active"),
         enabled: true,
         searchParams,
         getHooks,
+        propEditStore: projectPropEditStore,
       });
     } catch (error) {
       console.error("[custom-props] failed to initialize", error);
+    }
+  } else {
+    projectPropEditStore.clear();
+  }
+
+  let constructionController: ConstructionController | null = null;
+  const constructionParam = searchParams.get("construction");
+  const constructionEnabled = constructionParam === "1"
+    ? true
+    : constructionParam === "0"
+      ? false
+      : defaultConstructionConfig.enabled;
+  if (constructionEnabled) {
+    try {
+      constructionController = createConstructionController({
+        scene,
+        camera,
+        rendererDomElement: app.renderer.domElement,
+        worldCells,
+      });
+    } catch (error) {
+      console.error("[construction] failed to initialize", error);
     }
   }
 
@@ -254,5 +297,6 @@ export async function runRuntimeSystemsStartup(
     updateLighting,
     drainVegetationDirtyQueue,
     customProps,
+    constructionController,
   };
 }

@@ -48,7 +48,13 @@ describe("hydrology LOD0 border chains", () => {
       const b = buildLod0PageSource(bx, bz, cfg, world);
       const chainA = borderChain(a.mesh, axis, plane, a.footprint);
       const chainB = borderChain(b.mesh, axis, plane, b.footprint);
-      expect(() => assertBorderMatch(chainA, chainB, cfg.validation)).not.toThrow();
+      expect(() =>
+        assertBorderMatch(chainA, chainB, {
+          position: cfg.validation.position_epsilon,
+          normalDot: cfg.validation.normal_dot_min,
+          material: cfg.validation.material_weight_epsilon,
+        }),
+      ).not.toThrow();
     }
   }, 60_000);
 });

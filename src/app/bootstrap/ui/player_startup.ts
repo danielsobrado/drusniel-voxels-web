@@ -2,6 +2,7 @@ import * as THREE from "three";
 import { surfaceHeight } from "../../../terrain/terrain.js";
 import { createPlayerModeController } from "../../../player/player_mode_controller.js";
 import { createPlayerInputController } from "../../../player/player_input_controller.js";
+import { createFirstPersonWeapon, createSwordAttackController } from "../../../combat/index.js";
 import type { InfoPanelController } from "../info_panel_startup.js";
 import type { TerrainEditStartupResult } from "./terrain_edit_startup.js";
 import type { UiStartupContext } from "../ui_startup_context.js";
@@ -14,6 +15,7 @@ export function runPlayerStartup(
   const { input, session } = ctx;
   const {
     renderer,
+    scene,
     camera,
     controls,
     player,
@@ -30,6 +32,14 @@ export function runPlayerStartup(
   if (!session.digRadiusController) {
     throw new Error("Player startup requires digRadiusController from texture UI startup");
   }
+
+  const weapon = createFirstPersonWeapon({ scene, camera });
+  const combatController = createSwordAttackController({
+    camera,
+    weapon,
+    isEnabled: () => interaction.mode === "playing",
+  });
+  const config = combatController.getConfig();
 
   const playerInputController = createPlayerInputController({
     renderer,
@@ -51,6 +61,14 @@ export function runPlayerStartup(
       bindings.syncTerraformMenu();
       updateInfo();
     },
+    cycleBrushShape: () => {
+      const shapes = ["sphere", "cube", "cylinder"] as const;
+      const current = shapes.indexOf(state.brushShape);
+      state.brushShape = shapes[(current + 1) % shapes.length];
+      bindings.syncTerraformMenu();
+      updateInfo();
+    },
+    triggerSwordAttack: () => combatController.trigger(),
   });
 
   const playerModeController = createPlayerModeController({
@@ -77,6 +95,12 @@ export function runPlayerStartup(
   playerModeController.applyQuerySpawn();
   playerModeController.updatePlayerModeUi();
 
+  const offset = new THREE.Vector3(...config.camera_offset);
+  weapon.load(config.model_path, offset).catch((error: unknown) => {
+    console.warn("[combat] failed to load first-person weapon model", error);
+  });
+
   session.playerInputController = playerInputController;
   session.playerModeController = playerModeController;
+  session.combatController = combatController;
 }

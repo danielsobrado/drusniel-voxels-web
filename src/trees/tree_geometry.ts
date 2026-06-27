@@ -1,6 +1,5 @@
 import * as THREE from "three";
 import { TREE_LODS, TREE_SPECIES, type TreeLod, type TreeSettings, type TreeSpeciesId } from "./tree_config.js";
-import { foliageAtlasCell } from "./tree_alpha_mask.js";
 import { buildTree, type VegLod } from "../veg/veg_tree_builder.js";
 import { vegRng } from "../veg/veg_rng.js";
 import { VEG_BARK_COLOR, VEG_TREE_SPECIES } from "../veg/veg_species.js";
@@ -10,12 +9,11 @@ export type TreeVariantGeometryMap = Record<number, Record<TreeLod, THREE.Buffer
 export type TreeSpeciesGeometryMap = Record<TreeLod, THREE.BufferGeometry> & { variants: TreeVariantGeometryMap };
 export type TreeGeometryMap = Record<TreeSpeciesId, TreeSpeciesGeometryMap>;
 
-const BARK = new THREE.Color(0x5b3a22);
-const DEAD_BARK = new THREE.Color(0x7a6653);
 const OAK_LEAF_LOW = new THREE.Color(0x2c6f36);
 const OAK_LEAF_HIGH = new THREE.Color(0x4f9a42);
 const PINE_LEAF_LOW = new THREE.Color(0x1d4e32);
 const PINE_LEAF_HIGH = new THREE.Color(0x367142);
+const DEAD_BARK = new THREE.Color(0x7a6653);
 
 export function createTreeGeometryMap(settings: TreeSettings): TreeGeometryMap {
   const out = {} as TreeGeometryMap;
@@ -135,12 +133,7 @@ function createTreeGeometry(
   const config = settings.species[species];
 
   if (lod === "impostor") {
-    const builder = new GeometryBuilder();
-    appendImpostorTree(builder, species, config, settings);
-    const geometry = builder.build();
-    geometry.computeBoundingSphere();
-    geometry.computeBoundingBox();
-    return geometry;
+    return createOpaqueImpostorTree(species, config);
   }
 
   // All LODs for the same species+variant derive from the same skeleton seed;
@@ -159,6 +152,48 @@ function createTreeGeometry(
   return geometry;
 }
 
+function createOpaqueImpostorTree(
+  species: TreeSpeciesId,
+  config: TreeSettings["species"][TreeSpeciesId],
+): THREE.BufferGeometry {
+  const builder = new GeometryBuilder();
+  const bark = species === "dead" ? DEAD_BARK : VEG_BARK_COLOR[species];
+  const trunkHeight = Math.max(0.35, config.trunkHeightM);
+  const trunkWidth = Math.max(0.12, config.trunkRadiusM * 2.0);
+  builder.addBox(
+    new THREE.Vector3(0, trunkHeight * 0.5, 0),
+    new THREE.Vector3(trunkWidth, trunkHeight, trunkWidth),
+    bark,
+    species === "dead" ? 0.18 : 0.32,
+    0,
+    0,
+  );
+
+  if (species !== "dead" && config.crownRadiusM > 0.01) {
+    const leafColor = species === "pine"
+      ? PINE_LEAF_LOW.clone().lerp(PINE_LEAF_HIGH, 0.35)
+      : OAK_LEAF_LOW.clone().lerp(OAK_LEAF_HIGH, 0.45);
+    const crownY = species === "pine"
+      ? trunkHeight + config.crownRadiusM * 1.15
+      : trunkHeight + config.crownRadiusM * 0.78;
+    const crownRadius = Math.max(0.3, config.crownRadiusM * (species === "pine" ? 0.74 : 0.95));
+    const crownHeight = Math.max(0.6, config.crownRadiusM * (species === "pine" ? 2.2 : 1.2));
+    builder.addOctahedron(
+      new THREE.Vector3(0, crownY, 0),
+      new THREE.Vector3(crownRadius, crownHeight * 0.5, crownRadius),
+      leafColor,
+      0.64,
+      species === "pine" ? 0.15 : 0.24,
+      1,
+    );
+  }
+
+  const geometry = builder.build();
+  geometry.computeBoundingSphere();
+  geometry.computeBoundingBox();
+  return geometry;
+}
+
 export function treeGeometryVariant(
   map: TreeGeometryMap,
   species: TreeSpeciesId,
@@ -167,85 +202,6 @@ export function treeGeometryVariant(
 ): THREE.BufferGeometry {
   const safeVariant = Math.max(0, Math.min(TREE_STRUCTURAL_VARIANTS - 1, Math.floor(variant)));
   return map[species].variants?.[safeVariant]?.[lod] ?? map[species][lod];
-}
-
-function appendImpostorTree(
-  builder: GeometryBuilder,
-  species: TreeSpeciesId,
-  config: TreeSettings["species"][TreeSpeciesId],
-  settings: TreeSettings,
-): void {
-  const bark = species === "dead" ? DEAD_BARK : BARK;
-  const trunkWidth = Math.max(0.18, config.trunkRadiusM * (species === "dead" ? 2.4 : 1.7));
-  for (const rotation of [0, Math.PI * 0.5]) {
-    builder.addFlatCard(
-      new THREE.Vector3(0, config.trunkHeightM * 0.5, 0),
-      trunkWidth,
-      config.trunkHeightM,
-      rotation,
-      0,
-      bark,
-      species === "dead" ? 0.22 : 0.38,
-      0,
-      centeredFrame(),
-      0,
-    );
-  }
-
-  if (species === "dead") {
-    appendDeadImpostorBranches(builder, config);
-    return;
-  }
-
-  const leafColor = species === "pine"
-    ? PINE_LEAF_LOW.clone().lerp(PINE_LEAF_HIGH, 0.35)
-    : OAK_LEAF_LOW.clone().lerp(OAK_LEAF_HIGH, 0.45);
-  const crownWidth = species === "pine" ? config.crownRadiusM * 1.75 : config.crownRadiusM * 2.75;
-  const crownHeight = species === "pine"
-    ? config.crownRadiusM * 2.85 * config.morphology.crownFlattening
-    : config.crownRadiusM * 1.55 / Math.max(0.55, config.morphology.crownFlattening);
-  const centerY = species === "pine" ? config.trunkHeightM + crownHeight * 0.42 : config.trunkHeightM + crownHeight * 0.54;
-  const rotations = species === "pine" ? [0, Math.PI * 0.5] : [0, Math.PI / 3, Math.PI * 2 / 3];
-  for (let i = 0; i < rotations.length; i++) {
-    builder.addFlatCard(
-      new THREE.Vector3(0, centerY, 0),
-      crownWidth,
-      crownHeight,
-      rotations[i],
-      species === "pine" ? -0.06 : 0.03,
-      leafColor,
-      0.72,
-      species === "pine" ? 0.12 : 0.18,
-      atlasFrame(foliageAtlasCell(species, i, settings), settings),
-      1,
-    );
-  }
-}
-
-function appendDeadImpostorBranches(
-  builder: GeometryBuilder,
-  config: TreeSettings["species"][TreeSpeciesId],
-): void {
-  const branches: readonly [THREE.Vector3, THREE.Vector3, number][] = [
-    [
-      new THREE.Vector3(0, config.trunkHeightM * 0.62, 0),
-      new THREE.Vector3(config.morphology.branchLength * 0.7, config.trunkHeightM * 0.82, 0.18),
-      0.09,
-    ],
-    [
-      new THREE.Vector3(0, config.trunkHeightM * 0.72, 0),
-      new THREE.Vector3(-config.morphology.branchLength * 0.58, config.trunkHeightM * 0.88, -0.16),
-      0.075,
-    ],
-    [
-      new THREE.Vector3(0, config.trunkHeightM * 0.82, 0),
-      new THREE.Vector3(config.morphology.branchLength * 0.36, config.trunkHeightM * 1.04, -0.1),
-      0.06,
-    ],
-  ];
-  for (const [start, end, width] of branches) {
-    builder.addBranchCard(start, end, width, DEAD_BARK, 0.24, 0.02);
-  }
 }
 
 class GeometryBuilder {
@@ -277,8 +233,78 @@ class GeometryBuilder {
     return this.positions.length / 3 - 1;
   }
 
+  addTriangle(
+    p0: THREE.Vector3,
+    p1: THREE.Vector3,
+    p2: THREE.Vector3,
+    color: THREE.Color,
+    windWeight: number,
+    flutterWeight: number,
+    foliageMask: number,
+  ): void {
+    const normal = new THREE.Vector3().crossVectors(
+      p1.clone().sub(p0),
+      p2.clone().sub(p0),
+    ).normalize();
+    const a = this.addVertex(p0, normal, color, windWeight, flutterWeight, [0.5, 0.5], foliageMask);
+    const b = this.addVertex(p1, normal, color, windWeight, flutterWeight, [0.5, 0.5], foliageMask);
+    const c = this.addVertex(p2, normal, color, windWeight, flutterWeight, [0.5, 0.5], foliageMask);
+    this.indices.push(a, b, c);
+  }
+
   addQuad(a: number, b: number, c: number, d: number): void {
     this.indices.push(a, b, c, a, c, d);
+  }
+
+  addBox(
+    center: THREE.Vector3,
+    size: THREE.Vector3,
+    color: THREE.Color,
+    windWeight: number,
+    flutterWeight: number,
+    foliageMask: number,
+  ): void {
+    const hx = size.x * 0.5;
+    const hy = size.y * 0.5;
+    const hz = size.z * 0.5;
+    const p = [
+      new THREE.Vector3(center.x - hx, center.y - hy, center.z - hz),
+      new THREE.Vector3(center.x + hx, center.y - hy, center.z - hz),
+      new THREE.Vector3(center.x + hx, center.y + hy, center.z - hz),
+      new THREE.Vector3(center.x - hx, center.y + hy, center.z - hz),
+      new THREE.Vector3(center.x - hx, center.y - hy, center.z + hz),
+      new THREE.Vector3(center.x + hx, center.y - hy, center.z + hz),
+      new THREE.Vector3(center.x + hx, center.y + hy, center.z + hz),
+      new THREE.Vector3(center.x - hx, center.y + hy, center.z + hz),
+    ];
+    const faces: readonly [number, number, number, number][] = [
+      [0, 1, 2, 3], [5, 4, 7, 6], [4, 0, 3, 7],
+      [1, 5, 6, 2], [3, 2, 6, 7], [4, 5, 1, 0],
+    ];
+    for (const [a, b, c, d] of faces) {
+      this.addTriangle(p[a], p[b], p[c], color, windWeight, flutterWeight, foliageMask);
+      this.addTriangle(p[a], p[c], p[d], color, windWeight, flutterWeight, foliageMask);
+    }
+  }
+
+  addOctahedron(
+    center: THREE.Vector3,
+    radius: THREE.Vector3,
+    color: THREE.Color,
+    windWeight: number,
+    flutterWeight: number,
+    foliageMask: number,
+  ): void {
+    const top = center.clone().add(new THREE.Vector3(0, radius.y, 0));
+    const bottom = center.clone().add(new THREE.Vector3(0, -radius.y, 0));
+    const east = center.clone().add(new THREE.Vector3(radius.x, 0, 0));
+    const west = center.clone().add(new THREE.Vector3(-radius.x, 0, 0));
+    const north = center.clone().add(new THREE.Vector3(0, 0, -radius.z));
+    const south = center.clone().add(new THREE.Vector3(0, 0, radius.z));
+    for (const [a, b] of [[north, east], [east, south], [south, west], [west, north]] as const) {
+      this.addTriangle(top, a, b, color, windWeight, flutterWeight, foliageMask);
+      this.addTriangle(bottom, b, a, color, windWeight * 0.6, flutterWeight, foliageMask);
+    }
   }
 
   addFlatCard(
@@ -313,27 +339,6 @@ class GeometryBuilder {
     this.addQuad(a, b, c, d);
   }
 
-  addBranchCard(
-    start: THREE.Vector3,
-    end: THREE.Vector3,
-    width: number,
-    color: THREE.Color,
-    windWeight: number,
-    flutterWeight: number,
-  ): void {
-    const axis = end.clone().sub(start);
-    if (axis.lengthSq() <= 1e-8) return;
-    const right = new THREE.Vector3(axis.z, 0, -axis.x);
-    if (right.lengthSq() <= 1e-8) right.set(1, 0, 0);
-    right.normalize().multiplyScalar(width * 0.5);
-    const normal = new THREE.Vector3().crossVectors(right, axis).normalize();
-    const a = this.addVertex(start.clone().sub(right), normal, color, windWeight, flutterWeight);
-    const b = this.addVertex(start.clone().add(right), normal, color, windWeight, flutterWeight);
-    const c = this.addVertex(end.clone().add(right), normal, color, windWeight, flutterWeight);
-    const d = this.addVertex(end.clone().sub(right), normal, color, windWeight, flutterWeight);
-    this.addQuad(a, b, c, d);
-  }
-
   build(): THREE.BufferGeometry {
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute("position", new THREE.Float32BufferAttribute(this.positions, 3));
@@ -357,32 +362,6 @@ interface AtlasFrame {
   u1: number;
   v0: number;
   v1: number;
-}
-
-function atlasFrame(cell: number, settings: TreeSettings): AtlasFrame {
-  const columns = settings.foliage.textureAtlasColumns;
-  const rows = settings.foliage.textureAtlasRows;
-  const cellCount = columns * rows;
-  const safeCell = Math.max(0, Math.min(cellCount - 1, cell));
-  const x = safeCell % columns;
-  const y = Math.floor(safeCell / columns);
-  const insetU = 0.5 / (columns * settings.foliage.maskResolutionPx);
-  const insetV = 0.5 / (rows * settings.foliage.maskResolutionPx);
-  return {
-    u0: x / columns + insetU,
-    u1: (x + 1) / columns - insetU,
-    v0: y / rows + insetV,
-    v1: (y + 1) / rows - insetV,
-  };
-}
-
-function centeredFrame(): AtlasFrame {
-  return {
-    u0: 0.5,
-    u1: 0.5,
-    v0: 0.5,
-    v1: 0.5,
-  };
 }
 
 function unitFrame(): AtlasFrame {

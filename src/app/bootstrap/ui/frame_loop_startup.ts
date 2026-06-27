@@ -122,6 +122,7 @@ export function runFrameLoopStartup(
     understoryStats,
     forestLightingStats,
     customProps,
+    constructionController,
   } = input.runtime;
   const deepOceanMeshPresent = deepOceanSurface !== null;
   const { updateInfo } = infoPanel;
@@ -135,6 +136,10 @@ export function runFrameLoopStartup(
   if (customProps?.propController) {
     player.attachPropColliders(customProps.propController.colliderSet);
   }
+
+  constructionController?.setTerrainConformHandler((request) => {
+    terrainEdit.scheduleConstructionTerrainConform(request);
+  });
 
   window.addEventListener("resize", () => {
     camera.aspect = window.innerWidth / window.innerHeight;
@@ -259,5 +264,17 @@ export function runFrameLoopStartup(
       : session.naadfStatsController
         ? { onFarSummaryUpdate: () => { session.naadfStatsController?.updateDisplay(); } }
         : undefined,
+    construction: constructionController
+      ? {
+          update: () => {
+            constructionController.update();
+            session.constructionBuildActive = constructionController.stats().active;
+          },
+          isActive: () => constructionController.stats().active,
+        }
+      : undefined,
+    combat: session.combatController
+      ? { update: (timeMs) => session.combatController!.update(timeMs) }
+      : undefined,
   });
 }

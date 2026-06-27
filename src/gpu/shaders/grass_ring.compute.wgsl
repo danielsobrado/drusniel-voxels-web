@@ -7,6 +7,15 @@ const INDIRECT_STRIDE_U32: u32 = 5u;
 const TAU: f32 = 6.28318530718;
 const GRASS_WATER_CLEARANCE: f32 = 0.18;
 const GRASS_HYDRO_WATER_CLEARANCE: f32 = 0.35;
+const GRASS_LOW_BANK_START_M: f32 = 0.8;
+const GRASS_LOW_BANK_END_M: f32 = 4.2;
+const GRASS_MOIST_BANK_START_M: f32 = 3.2;
+const GRASS_MOIST_BANK_END_M: f32 = 11.0;
+const GRASS_MID_HEIGHT_MUL: f32 = 1.18;
+const GRASS_FAR_HEIGHT_MUL: f32 = 1.30;
+const GRASS_SUPER_HEIGHT_MUL: f32 = 1.42;
+const GRASS_FAR_WIDTH_MUL_MAX: f32 = 1.55;
+const GRASS_SUPER_WIDTH_EXTRA: f32 = 1.08;
 
 struct Params {
   center_radius: vec4<f32>,
@@ -17,6 +26,9 @@ struct Params {
   counts_b: vec4<u32>,
   density_a: vec4<f32>,
   density_b: vec4<f32>,
+  material_density: vec4<f32>,
+  height_density_a: vec4<f32>,
+  height_density_b: vec4<f32>,
   planes: array<vec4<f32>, 6>,
 };
 
@@ -25,6 +37,14 @@ struct HydrologySample {
   wet_mask: f32,
   carved_bed: f32,
   enabled: f32,
+};
+
+struct GrassRiverBand {
+  channel_clear: f32,
+  low_bank: f32,
+  moist_bank: f32,
+  density: f32,
+  height: f32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -77,20 +97,9 @@ fn hydrology_at(wx: f32, wz: f32) -> HydrologySample {
   return HydrologySample(h.x, h.y, h.z, 1.0);
 }
 
-fn hydrology_ground_height(raw_height: f32, sample: HydrologySample) -> f32 {
-  if (sample.enabled < 0.5) {
-    return raw_height;
-  }
-  return sample.carved_bed;
-}
-
 fn hydrology_reject_grass(sample: HydrologySample, ground_height: f32) -> bool {
-  if (sample.enabled < 0.5) {
-    return false;
-  }
-  if (sample.wet_mask <= 0.05) {
-    return false;
-  }
+  if (sample.enabled < 0.5) { return false; }
+  if (sample.wet_mask <= 0.05) { return false; }
   return ground_height <= sample.water_y + GRASS_HYDRO_WATER_CLEARANCE;
 }
 
@@ -129,6 +138,19 @@ fn material_weights_with_paint(height: f32, normal_y: f32, wx: f32, wz: f32) -> 
   return base;
 }
 
+fn grass_height_density(height: f32) -> f32 {
+  let blend = max(0.001, params.height_density_a.z);
+  let low = 1.0 - smoothstep(params.height_density_a.x - blend, params.height_density_a.x + blend, height);
+  let high = smoothstep(params.height_density_a.y - blend, params.height_density_a.y + blend, height);
+  let mid = max(0.0, 1.0 - low - high);
+  let sum = max(0.00001, low + mid + high);
+  return (params.height_density_a.w * low + params.height_density_b.x * mid + params.height_density_b.y * high) / sum;
+}
+
+fn grass_terrain_density(weights: vec4<f32>, height: f32) -> f32 {
+  return max(0.0, dot(weights, params.material_density)) * grass_height_density(height);
+}
+
 fn wet_bank(height: f32, normal_y: f32) -> f32 {
   let bank_height = (1.0 - smoothstep(WATER_LEVEL + 1.0, WATER_LEVEL + 8.0, height))
     * smoothstep(WATER_LEVEL + GRASS_WATER_CLEARANCE, WATER_LEVEL + 2.5, height);
@@ -156,34 +178,48 @@ fn fallback_river_distance_m(wx: f32, wz: f32) -> f32 {
   return d * world_size;
 }
 
-fn river_grass_density_mask(wx: f32, wz: f32) -> f32 {
+fn fallback_river_grass_band(wx: f32, wz: f32) -> GrassRiverBand {
   let dist = fallback_river_distance_m(wx, wz);
-  let wet_channel = 1.0 - smoothstep(7.0, 12.0, dist);
-  let moist_bank = smoothstep(9.0, 16.0, dist) * (1.0 - smoothstep(16.0, 28.0, dist));
-  return clamp((1.0 - wet_channel) * mix(0.92, 1.08, moist_bank), 0.0, 1.08);
+  let channel_clear = 1.0 - smoothstep(7.0, 12.0, dist);
+  let low_bank = smoothstep(8.0, 13.0, dist) * (1.0 - smoothstep(13.0, 20.0, dist));
+  let moist_bank = smoothstep(16.0, 24.0, dist) * (1.0 - smoothstep(24.0, 42.0, dist));
+  let density = clamp((1.0 - channel_clear) * mix(0.68, 1.12, moist_bank) * mix(1.0, 0.62, low_bank), 0.0, 1.12);
+  let height = clamp(mix(1.0, 0.56, low_bank) * mix(1.0, 1.08, moist_bank), 0.48, 1.10);
+  return GrassRiverBand(channel_clear, low_bank, moist_bank, density, height);
 }
 
-fn hydro_bank_density_mask(sample: HydrologySample, ground_height: f32) -> f32 {
+fn hydro_river_grass_band(sample: HydrologySample, ground_height: f32) -> GrassRiverBand {
   if (sample.enabled < 0.5 || sample.wet_mask <= 0.001) {
-    return 1.0;
+    return GrassRiverBand(0.0, 0.0, 0.0, 1.0, 1.0);
   }
   let above_water = ground_height - sample.water_y;
-  let outer_bank = smoothstep(GRASS_HYDRO_WATER_CLEARANCE, 2.4, above_water);
-  let moist_boost = smoothstep(1.1, 3.5, above_water) * (1.0 - smoothstep(3.5, 7.0, above_water));
-  return clamp(outer_bank * mix(0.92, 1.10, moist_boost), 0.0, 1.10);
+  let channel_clear = 1.0 - smoothstep(GRASS_HYDRO_WATER_CLEARANCE, GRASS_LOW_BANK_START_M, above_water);
+  let low_bank = smoothstep(GRASS_LOW_BANK_START_M, 1.8, above_water) * (1.0 - smoothstep(2.9, GRASS_LOW_BANK_END_M, above_water));
+  let moist_bank = smoothstep(GRASS_MOIST_BANK_START_M, 5.6, above_water) * (1.0 - smoothstep(7.8, GRASS_MOIST_BANK_END_M, above_water));
+  let density = clamp((1.0 - channel_clear) * mix(0.62, 1.16, moist_bank) * mix(1.0, 0.58, low_bank), 0.0, 1.16);
+  let height = clamp(mix(1.0, 0.52, low_bank) * mix(1.0, 1.08, moist_bank), 0.46, 1.10);
+  return GrassRiverBand(channel_clear, low_bank, moist_bank, density, height);
+}
+
+fn river_grass_ecology_band(wx: f32, wz: f32, hydro: HydrologySample, height: f32) -> GrassRiverBand {
+  let fallback = fallback_river_grass_band(wx, wz);
+  let hydro_band = hydro_river_grass_band(hydro, height);
+  return GrassRiverBand(
+    max(fallback.channel_clear, hydro_band.channel_clear),
+    max(fallback.low_bank, hydro_band.low_bank),
+    max(fallback.moist_bank, hydro_band.moist_bank),
+    min(fallback.density, hydro_band.density) * max(1.0, max(fallback.moist_bank, hydro_band.moist_bank) * 1.08),
+    min(fallback.height, hydro_band.height) * max(1.0, max(fallback.moist_bank, hydro_band.moist_bank) * 1.04),
+  );
 }
 
 fn grass_mask(height: f32, normal_y: f32, distance: f32, wx: f32, wz: f32, hydro: HydrologySample) -> f32 {
-  if (height < params.settings_b.x || height > params.settings_b.y) {
-    return 0.0;
-  }
+  if (height < params.settings_b.x || height > params.settings_b.y) { return 0.0; }
   let weights = material_weights_with_paint(height, normal_y, wx, wz);
   let grass_weight = weights.x;
   let rock_weight = weights.y;
   let snow_weight = weights.w;
-  if (height < WATER_LEVEL + GRASS_WATER_CLEARANCE || rock_weight >= 0.82 || snow_weight >= 0.55) {
-    return 0.0;
-  }
+  if (height < WATER_LEVEL + GRASS_WATER_CLEARANCE || rock_weight >= 0.82 || snow_weight >= 0.55) { return 0.0; }
   let above_water = smoothstep(WATER_LEVEL + GRASS_WATER_CLEARANCE, WATER_LEVEL + 3.5, height);
   let slope_min = params.settings_a.w;
   let slope_mask = smoothstep(max(0.0, slope_min - 0.04), min(1.0, slope_min + 0.16), normal_y);
@@ -191,25 +227,20 @@ fn grass_mask(height: f32, normal_y: f32, distance: f32, wx: f32, wz: f32, hydro
   let snow_reject = smoothstep(0.08, 0.55, snow_weight);
   let viable = above_water * slope_mask * (1.0 - rock_reject) * (1.0 - snow_reject);
   let bank = wet_bank(height, normal_y);
-  let river_mask = river_grass_density_mask(wx, wz) * hydro_bank_density_mask(hydro, height);
+  let river_band = river_grass_ecology_band(wx, wz, hydro, height);
   let scruff_meters = params.settings_b.z;
   let scruff_min = params.density_b.y;
-  let scruff = (1.0 - smoothstep(scruff_meters * 0.45, scruff_meters, distance))
-    * viable * scruff_min;
-  return clamp(max(grass_weight * viable * (1.0 - bank * 0.58), scruff) * river_mask, 0.0, 1.0);
+  let scruff = (1.0 - smoothstep(scruff_meters * 0.45, scruff_meters, distance)) * viable * scruff_min;
+  let terrain_density = grass_terrain_density(weights, height);
+  return clamp(max(grass_weight * viable * (1.0 - bank * 0.58), scruff) * river_band.density * terrain_density, 0.0, 1.0);
 }
 
 fn grass_thin(distance: f32) -> f32 {
-  let near_distance = params.density_a.x;
-  let mid_distance = max(near_distance + 0.001, params.density_a.y);
-  let far_end = max(mid_distance + 0.001, params.density_a.z);
-  let mid_fraction = clamp(params.density_a.w, 0.0, 1.0);
   let far_density = clamp(params.density_b.x, 0.0, 1.0);
   let d = max(distance, 0.0);
   let base = min(1.0, pow(58.0 / (d + 42.0), 1.15));
   let far = pow(min(1.0, 120.0 / max(d, 120.0)), 1.6);
-  let raw = base * far;
-  return clamp(raw, far_density, 1.0);
+  return clamp(base * far, far_density, 1.0);
 }
 
 fn edge_fade(wpos: vec2<f32>, height: f32, normal_y: f32) -> f32 {
@@ -228,44 +259,32 @@ fn edge_fade(wpos: vec2<f32>, height: f32, normal_y: f32) -> f32 {
 fn in_frustum(center: vec3<f32>, slack: f32) -> bool {
   for (var p = 0u; p < 6u; p = p + 1u) {
     let plane = params.planes[p];
-    if (dot(plane.xyz, center) + plane.w < -slack) {
-      return false;
-    }
+    if (dot(plane.xyz, center) + plane.w < -slack) { return false; }
   }
   return true;
 }
 
-fn append_candidate(tier: u32, wc: vec2<f32>, wpos: vec2<f32>, height: f32, normal: vec3<f32>, dist: f32, edge: f32, ring_edge: f32, thin: f32) {
+fn append_candidate(tier: u32, wc: vec2<f32>, wpos: vec2<f32>, height: f32, normal: vec3<f32>, dist: f32, edge: f32, ring_edge: f32, thin: f32, river_height: f32) {
   let max_per_tier = params.counts_b.x;
   let slot = atomicAdd(&counters[tier], 1u);
-  if (slot >= max_per_tier) {
-    return;
-  }
-
+  if (slot >= max_per_tier) { return; }
   let seed = params.counts_b.z;
-  let max_width_mul = max(1.0, params.settings_b.w);
+  let max_width_mul = min(max(1.0, params.settings_b.w), GRASS_FAR_WIDTH_MUL_MAX);
   var height_mul = 1.0;
   var width_mul = clamp(1.0 / sqrt(thin), 1.0, max_width_mul);
-  if (tier == TIER_MID) {
-    height_mul = 1.35;
-  } else if (tier == TIER_FAR) {
-    height_mul = 1.75;
-  } else if (tier == TIER_SUPER) {
-    height_mul = 2.25;
-    width_mul = min(max_width_mul, width_mul * 1.35);
-  }
-
+  if (tier == TIER_MID) { height_mul = GRASS_MID_HEIGHT_MUL; }
+  else if (tier == TIER_FAR) { height_mul = GRASS_FAR_HEIGHT_MUL; }
+  else if (tier == TIER_SUPER) { height_mul = GRASS_SUPER_HEIGHT_MUL; width_mul = min(max_width_mul, width_mul * GRASS_SUPER_WIDTH_EXTRA); }
   let weights = material_weights_with_paint(height, normal.y, wpos.x, wpos.y);
   let bank = wet_bank(height, normal.y);
   let height_jit = pcg2d(wc, seed + 1501u).x * 2.0 - 1.0;
-  let height_scale = max(0.1, 1.0 + height_jit * params.settings_a.z);
+  let height_scale = max(0.1, 1.0 + height_jit * params.settings_a.z) * river_height;
   let yaw = pcg2d(wc, seed + 1709u).x * TAU;
   let phase = pcg2d(wc, seed + 1801u).x * TAU;
   let color_hash = pcg2d(wc, seed + 1901u).x;
   let color_mix = min(1.0, color_hash * color_hash + bank * 0.16 + weights.z * 0.12);
   let gust_k = pcg2d(wc, seed + 2003u).x * 0.6 + 0.7;
   let out_index = tier * max_per_tier + slot;
-
   out_offset[out_index] = vec4<f32>(wpos.x, height + 0.02, wpos.y, 1.0);
   out_packed0[out_index] = vec4<f32>(params.settings_a.y * height_scale * height_mul, yaw, phase, color_mix);
   out_packed1[out_index] = vec4<f32>(min(edge, ring_edge), normal.y, width_mul, f32(tier));
@@ -274,79 +293,47 @@ fn append_candidate(tier: u32, wc: vec2<f32>, wpos: vec2<f32>, height: f32, norm
 
 fn process_slot(slot: u32) {
   let grid = params.counts_b.y;
-  if (slot >= grid * grid || params.counts_b.x == 0u) {
-    return;
-  }
+  if (slot >= grid * grid || params.counts_b.x == 0u) { return; }
   let wc = world_cell(slot);
   let seed = params.counts_b.z;
-  let jitter_scale = params.density_b.w;
-  let raw_jitter = pcg2d(wc, seed + 1103u);
-  let jitter = (raw_jitter - vec2<f32>(0.5, 0.5)) * jitter_scale;
+  let jitter = (pcg2d(wc, seed + 1103u) - vec2<f32>(0.5, 0.5)) * params.density_b.w;
   let wpos = (wc + vec2<f32>(0.5, 0.5) + jitter) * params.settings_a.x;
   let world_max = params.center_radius.w;
-  if (wpos.x <= 0.0 || wpos.y <= 0.0 || wpos.x >= world_max || wpos.y >= world_max) {
-    return;
-  }
+  if (wpos.x <= 0.0 || wpos.y <= 0.0 || wpos.x >= world_max || wpos.y >= world_max) { return; }
   let dist = distance(wpos, params.center_radius.xy);
-  if (dist > params.center_radius.z) {
-    return;
-  }
-
+  if (dist > params.center_radius.z) { return; }
   let world_size = max(1.0, params.center_radius.w);
   let hydro = hydrology_at(wpos.x, wpos.y);
   let height = placement_ground_height(wpos.x, wpos.y, world_size);
-  if (hydrology_reject_grass(hydro, height)) {
-    return;
-  }
+  if (hydrology_reject_grass(hydro, height)) { return; }
   let normal = normalize(densityGradient(wpos.x, height, wpos.y));
   let mask = grass_mask(height, normal.y, dist, wpos.x, wpos.y, hydro);
   let thin = grass_thin(dist);
   let ring_edge = 1.0 - smoothstep(params.center_radius.z * 0.9, params.center_radius.z, dist);
-  let accept = mask * ring_edge * thin;
-  if (pcg2d(wc, seed + 1301u).x >= accept) {
-    return;
-  }
+  if (pcg2d(wc, seed + 1301u).x >= mask * ring_edge * thin) { return; }
   let edge = edge_fade(wpos, height, normal.y);
-  if (edge < 0.18) {
-    return;
-  }
-  if (!in_frustum(vec3<f32>(wpos.x, height + 0.5, wpos.y), 1.4)) {
-    return;
-  }
-
+  if (edge < 0.18) { return; }
+  if (!in_frustum(vec3<f32>(wpos.x, height + 0.5, wpos.y), 1.4)) { return; }
+  let river_band = river_grass_ecology_band(wpos.x, wpos.y, hydro, height);
   let near_d = params.bands.x;
   let mid_d = params.bands.y;
   let far_d = params.bands.z;
   let band = params.bands.w;
-  if (dist < near_d + band) {
-    append_candidate(TIER_NEAR, wc, wpos, height, normal, dist, edge, ring_edge, thin);
-  }
-  if (dist >= near_d - band && dist < mid_d + band) {
-    append_candidate(TIER_MID, wc, wpos, height, normal, dist, edge, ring_edge, thin);
-  }
-  if (dist >= mid_d - band && dist < far_d + band) {
-    append_candidate(TIER_FAR, wc, wpos, height, normal, dist, edge, ring_edge, thin);
-  }
-  if (dist >= far_d - band) {
-    append_candidate(TIER_SUPER, wc, wpos, height, normal, dist, edge, ring_edge, thin);
-  }
+  if (dist < near_d + band) { append_candidate(TIER_NEAR, wc, wpos, height, normal, dist, edge, ring_edge, thin, river_band.height); }
+  if (dist >= near_d - band && dist < mid_d + band) { append_candidate(TIER_MID, wc, wpos, height, normal, dist, edge, ring_edge, thin, river_band.height); }
+  if (dist >= mid_d - band && dist < far_d + band) { append_candidate(TIER_FAR, wc, wpos, height, normal, dist, edge, ring_edge, thin, river_band.height); }
+  if (dist >= far_d - band) { append_candidate(TIER_SUPER, wc, wpos, height, normal, dist, edge, ring_edge, thin, river_band.height); }
 }
 
 @compute @workgroup_size(WORKGROUP_SIZE)
 fn clear_counters(@builtin(global_invocation_id) id: vec3<u32>) {
   let i = id.x;
-  if (i < 4u) {
-    atomicStore(&counters[i], 0u);
-  }
-  if (i < 20u) {
-    indirect_args[i] = 0u;
-  }
+  if (i < 4u) { atomicStore(&counters[i], 0u); }
+  if (i < 20u) { indirect_args[i] = 0u; }
 }
 
 @compute @workgroup_size(WORKGROUP_SIZE)
-fn grass_cull(@builtin(global_invocation_id) id: vec3<u32>) {
-  process_slot(id.x);
-}
+fn grass_cull(@builtin(global_invocation_id) id: vec3<u32>) { process_slot(id.x); }
 
 fn write_draw_args(tier: u32, index_count: u32, instance_count: u32) {
   let base = tier * INDIRECT_STRIDE_U32;
@@ -354,17 +341,12 @@ fn write_draw_args(tier: u32, index_count: u32, instance_count: u32) {
   indirect_args[base + 1u] = min(instance_count, params.counts_b.x);
   indirect_args[base + 2u] = 0u;
   indirect_args[base + 3u] = 0u;
-  // Grass relies on instanceIndex including firstInstance from indirect draw args.
-  // The smoke test (grass_first_instance_smoke.ts) proves this works correctly in WebGPU.
-  // Explicit tierBaseOffset is available in createGrassNodeMaterial for future use.
   indirect_args[base + 4u] = tier * params.counts_b.x;
 }
 
 @compute @workgroup_size(WORKGROUP_SIZE)
 fn build_indirect_args(@builtin(global_invocation_id) id: vec3<u32>) {
-  if (id.x != 0u) {
-    return;
-  }
+  if (id.x != 0u) { return; }
   write_draw_args(TIER_NEAR, params.counts_a.x, atomicLoad(&counters[TIER_NEAR]));
   write_draw_args(TIER_MID, params.counts_a.y, atomicLoad(&counters[TIER_MID]));
   write_draw_args(TIER_FAR, params.counts_a.z, atomicLoad(&counters[TIER_FAR]));

@@ -6,34 +6,73 @@ import type {
 import type { NaadfWorldState } from "./summaryStreamer.js";
 import { worldToChunkKey, worldToLocalCell } from "./keys.js";
 import { lookupValidatedChunkIndex } from "./residentLookup.js";
-import { sampleMipNodeAtWorld } from "./mipBuilder.js";
 import { sampleFarSummary } from "./farClipmap.js";
-import { estimateSafeSkipDistance, nodeRequiresRefine, sunNodeBlocksRay } from "./aadf.js";
 import { ringForDistance } from "./config.js";
-import { mipLevelForDistance, aadfSkipOccurred, recordMissingSample } from "./queryHelpers.js";
+import { recordMissingSample } from "./queryHelpers.js";
 import type { ResidentChunkEntry } from "./types.js";
+import { NaadfMetricsCollector } from "./metrics.js";
+import {
+  compareRayResults,
+  compareSunResults,
+  tracePrimaryDebugRayHdda,
+  traceSunVisibilityHdda,
+} from "./hdda.js";
 
 const QUERYABLE_STATES: ReadonlySet<ResidentChunkEntry["state"]> = new Set([
   "ready",
   "stale",
   "building",
 ]);
+const ORACLE_REFINE_STEPS = 8;
+
+type QueryPurpose = "render" | "shadow" | "canopy" | "material" | "debug";
+
+type PrimaryDenseParams = {
+  state: NaadfWorldState;
+  originX: number;
+  originY: number;
+  originZ: number;
+  dirX: number;
+  dirY: number;
+  dirZ: number;
+  maxDistanceM: number;
+};
+
+type SunDenseParams = {
+  state: NaadfWorldState;
+  worldX: number;
+  worldY: number;
+  worldZ: number;
+  sunDirX: number;
+  sunDirY: number;
+  sunDirZ: number;
+  maxDistanceM: number;
+};
+
+type LocalCounters = {
+  nearTableHits: number;
+  hashFallbackHits: number;
+  farClipmapHits: number;
+  missingSamples: number;
+};
+
+type PrimaryProbe = Readonly<{
+  x: number;
+  y: number;
+  z: number;
+  terrain: TerrainQueryResult;
+}>;
 
 function activeBrick(entry: ResidentChunkEntry) {
   if (!QUERYABLE_STATES.has(entry.state)) return null;
   return entry.brick;
 }
 
-function activeMipChain(entry: ResidentChunkEntry) {
-  if (!QUERYABLE_STATES.has(entry.state)) return null;
-  return entry.mipChain;
-}
-
 export function queryTerrainHeight(params: {
   state: NaadfWorldState;
   worldX: number;
   worldZ: number;
-  purpose: "render" | "shadow" | "canopy" | "material" | "debug";
+  purpose: QueryPurpose;
 }): TerrainQueryResult {
   const { state, worldX, worldZ, purpose } = params;
   const chunkSize = state.config.world.chunkSizeCells;
@@ -141,9 +180,6 @@ function finiteResult(
   water: number,
   source: "near_table" | "hash_fallback",
 ): TerrainQueryResult {
-  // PoC approximation: bricks do not store pre-computed normals.
-  // Return flat-up (0,1,0). Consumers that need true normals (shadow proxy,
-  // far shell mesh) should fall through to far_clipmap or macro sources.
   return {
     height: h,
     material: mat,
@@ -179,269 +215,267 @@ function unknownResult(): TerrainQueryResult {
   };
 }
 
-export function tracePrimaryDebugRay(params: {
-  state: NaadfWorldState;
-  originX: number;
-  originY: number;
-  originZ: number;
-  dirX: number;
-  dirY: number;
-  dirZ: number;
-  maxDistanceM: number;
-}): RayTraceResult {
+export function tracePrimaryDebugRay(params: PrimaryDenseParams): RayTraceResult {
+  if (params.state.config.traversal.mode === "hdda") {
+    return tracePrimaryDebugRayHdda({ ...params, queryHeight: queryTerrainHeight });
+  }
+  if (params.state.config.traversal.mode === "compare") {
+    const dense = withIsolatedMetrics(params.state, () => tracePrimaryDebugRayDense(params));
+    const hdda = tracePrimaryDebugRayHdda({ ...params, queryHeight: queryTerrainHeight });
+    const compare = compareRayResults(
+      dense,
+      hdda,
+      { x: params.originX, y: params.originY, z: params.originZ },
+      params.state.config,
+    );
+    if (compare.mismatchReason !== "none") {
+      params.state.metrics.hddaDenseMismatches++;
+      params.state.metrics.hddaFallbackToDense++;
+      return { ...dense, traversalMode: "compare", hdda: hdda.hdda, compare };
+    }
+    return { ...hdda, traversalMode: "compare", compare };
+  }
+  return tracePrimaryDebugRayDense(params);
+}
+
+function tracePrimaryDebugRayDense(params: PrimaryDenseParams): RayTraceResult {
   const { state, maxDistanceM } = params;
   let { originX, originY, originZ, dirX, dirY, dirZ } = params;
 
   const len = Math.hypot(dirX, dirY, dirZ);
-  if (len < 1e-10) return emptyRayResult();
+  if (len < 1e-10) return emptyRayResult("dense");
   dirX /= len;
   dirY /= len;
   dirZ /= len;
 
   const maxSteps = state.config.query.maxStepsPrimary;
-  const eps = state.config.query.epsilonM;
-  const cellSize = state.config.world.voxelSizeM;
+  const stepDistance = Math.max(state.config.query.epsilonM, state.config.world.voxelSizeM);
+  const counters = createLocalCounters();
   let traveled = 0;
   let steps = 0;
-  let aadfSkips = 0;
-  let nearTableHits = 0;
-  let hashFallbackHits = 0;
-  let farClipmapHits = 0;
-  let missingSamples = 0;
+  let probe = samplePrimaryProbe(state, counters, originX, originY, originZ, "debug");
 
   while (traveled < maxDistanceM && steps < maxSteps) {
     steps++;
-    const q = queryTerrainHeight({
-      state,
-      worldX: originX,
-      worldZ: originZ,
-      purpose: "debug",
-    });
-    if (q.nearTableHit) nearTableHits++;
-    if (q.hashFallbackHit) hashFallbackHits++;
-    if (q.farClipmapHit) farClipmapHits++;
-    if (q.unknown || q.missingSample) missingSamples++;
-
-    if (originY <= q.height) {
+    if (probe.y <= probe.terrain.height) {
       state.metrics.primarySteps.add(steps);
-      state.metrics.aadfSkips += aadfSkips;
-      return {
-        hit: true,
-        unknown: q.unknown,
-        hitX: originX,
-        hitY: q.height,
-        hitZ: originZ,
-        material: q.material,
-        steps,
-        aadfSkips,
-        nearTableHits,
-        hashFallbackHits,
-        farClipmapHits,
-        missingSamples,
-      };
+      return primaryHitResult(probe, steps, counters, "dense");
     }
 
-    const chunkSize = state.config.world.chunkSizeCells;
-    const key = worldToChunkKey(originX, originZ, chunkSize);
-    const lookup = lookupValidatedChunkIndex(state.nearTable, state.hashFallback, state.residents, key);
-    let skip = cellSize;
-
-    const dist = Math.hypot(originX - state.cameraX, originZ - state.cameraZ);
-    const mipLevel = mipLevelForDistance(
-      dist,
-      chunkSize,
-      cellSize,
-      state.config.query.primaryLodBias,
+    const nextTravel = Math.min(maxDistanceM, traveled + stepDistance);
+    const segmentDistance = nextTravel - traveled;
+    const nextProbe = samplePrimaryProbe(
+      state,
+      counters,
+      probe.x + dirX * segmentDistance,
+      probe.y + dirY * segmentDistance,
+      probe.z + dirZ * segmentDistance,
+      "debug",
     );
 
-    if (lookup.index >= 0) {
-      const entry = state.residents[lookup.index];
-      const mipChain = entry ? activeMipChain(entry) : null;
-      if (mipChain) {
-        const local = worldToLocalCell(originX, originZ, key, chunkSize);
-        const node = sampleMipNodeAtWorld(mipChain, local.localX, local.localZ, mipLevel, chunkSize);
-        if (node) {
-          const boundary = cellSize;
-          skip = estimateSafeSkipDistance({
-            node,
-            rayDirX: dirX,
-            rayDirY: dirY,
-            rayDirZ: dirZ,
-            cellSizeM: cellSize,
-            nextCellBoundaryDistanceM: boundary,
-            epsilonM: eps,
-            config: state.config,
-          });
-          if (aadfSkipOccurred(skip, boundary)) aadfSkips++;
-        }
-      }
-    } else if (dist >= (state.config.farClipmap.rings[0]?.startM ?? Infinity)) {
-      const far = sampleFarSummary({
-        worldX: originX,
-        worldZ: originZ,
-        purpose: "height",
-        cameraX: state.cameraX,
-        cameraZ: state.cameraZ,
-        store: state.farTiles,
-        config: state.config,
-        source: state.source,
-        forceMissingStress: state.forceMissingStress,
-      });
-      if (!far.unknown) {
-        farClipmapHits++;
-        skip = Math.max(eps, Math.min(cellSize * 4, far.maxHeight - originY + cellSize));
-      }
+    if (nextProbe.y <= nextProbe.terrain.height) {
+      const hit = refinePrimaryCrossing(state, counters, probe, nextProbe, "debug");
+      state.metrics.primarySteps.add(steps);
+      return primaryHitResult(hit, steps, counters, "dense");
     }
 
-    traveled += skip;
-    originX += dirX * skip;
-    originY += dirY * skip;
-    originZ += dirZ * skip;
+    traveled = nextTravel;
+    probe = nextProbe;
   }
 
   state.metrics.primarySteps.add(steps);
-  state.metrics.aadfSkips += aadfSkips;
   return {
     hit: false,
-    unknown: missingSamples > 0,
-    hitX: originX,
-    hitY: originY,
-    hitZ: originZ,
+    unknown: counters.missingSamples > 0,
+    hitX: probe.x,
+    hitY: probe.y,
+    hitZ: probe.z,
     material: 0,
     steps,
-    aadfSkips,
-    nearTableHits,
-    hashFallbackHits,
-    farClipmapHits,
-    missingSamples,
+    aadfSkips: 0,
+    nearTableHits: counters.nearTableHits,
+    hashFallbackHits: counters.hashFallbackHits,
+    farClipmapHits: counters.farClipmapHits,
+    missingSamples: counters.missingSamples,
+    traversalMode: "dense",
   };
 }
 
-export function traceSunVisibility(params: {
-  state: NaadfWorldState;
-  worldX: number;
-  worldY: number;
-  worldZ: number;
-  sunDirX: number;
-  sunDirY: number;
-  sunDirZ: number;
-  maxDistanceM: number;
-}): SunVisibilityResult {
+export function traceSunVisibility(params: SunDenseParams): SunVisibilityResult {
+  if (params.state.config.traversal.mode === "hdda") {
+    return traceSunVisibilityHdda({ ...params, queryHeight: queryTerrainHeight });
+  }
+  if (params.state.config.traversal.mode === "compare") {
+    const dense = withIsolatedMetrics(params.state, () => traceSunVisibilityDense(params));
+    const hdda = traceSunVisibilityHdda({ ...params, queryHeight: queryTerrainHeight });
+    const compare = compareSunResults(dense, hdda);
+    if (compare.mismatchReason !== "none") {
+      params.state.metrics.hddaDenseMismatches++;
+      params.state.metrics.hddaFallbackToDense++;
+      return { ...dense, traversalMode: "compare", hdda: hdda.hdda, compare };
+    }
+    return { ...hdda, traversalMode: "compare", compare };
+  }
+  return traceSunVisibilityDense(params);
+}
+
+function traceSunVisibilityDense(params: SunDenseParams): SunVisibilityResult {
   const { state, worldX, worldY, worldZ, maxDistanceM } = params;
   let { sunDirX, sunDirY, sunDirZ } = params;
 
   const len = Math.hypot(sunDirX, sunDirY, sunDirZ);
   if (len < 1e-10) {
-    return { visible: true, unknown: false, blocked: false, steps: 0, aadfSkips: 0, nearTableHits: 0, hashFallbackHits: 0, farClipmapHits: 0, missingSamples: 0 };
+    return { visible: true, unknown: false, blocked: false, steps: 0, aadfSkips: 0, nearTableHits: 0, hashFallbackHits: 0, farClipmapHits: 0, missingSamples: 0, traversalMode: "dense" };
   }
   sunDirX /= len;
   sunDirY /= len;
   sunDirZ /= len;
 
   const maxSteps = state.config.query.maxStepsSun;
-  const eps = state.config.query.epsilonM;
-  const cellSize = state.config.world.voxelSizeM;
-  let x = worldX;
-  let y = worldY;
-  let z = worldZ;
+  const stepDistance = Math.max(state.config.query.epsilonM, state.config.world.voxelSizeM);
+  const counters = createLocalCounters();
   let traveled = 0;
   let steps = 0;
-  let aadfSkips = 0;
-  let nearTableHits = 0;
-  let hashFallbackHits = 0;
-  let farClipmapHits = 0;
-  let missingSamples = 0;
+  let probe = samplePrimaryProbe(state, counters, worldX, worldY, worldZ, "shadow");
 
   while (traveled < maxDistanceM && steps < maxSteps) {
     steps++;
-
-    const q = queryTerrainHeight({ state, worldX: x, worldZ: z, purpose: "shadow" });
     state.metrics.shadowProxySamples++;
-    if (q.nearTableHit) nearTableHits++;
-    if (q.hashFallbackHit) hashFallbackHits++;
-    if (q.farClipmapHit) farClipmapHits++;
 
-    if (q.unknown) {
-      missingSamples++;
+    if (probe.terrain.unknown) {
       if (state.config.query.unknownCountsAsBlockedForSun) {
         state.metrics.unknownSunSamples++;
         state.metrics.sunSteps.add(steps);
-        state.metrics.aadfSkips += aadfSkips;
-        return { visible: false, unknown: true, blocked: true, steps, aadfSkips, nearTableHits, hashFallbackHits, farClipmapHits, missingSamples };
+        return sunBlockedResult(true, steps, counters, "dense");
       }
-      x += sunDirX * eps;
-      y += sunDirY * eps;
-      z += sunDirZ * eps;
-      traveled += eps;
-      continue;
     }
 
-    if (y <= q.height) {
+    if (probe.y <= probe.terrain.height) {
       state.metrics.sunSteps.add(steps);
-      state.metrics.aadfSkips += aadfSkips;
-      return { visible: false, unknown: false, blocked: true, steps, aadfSkips, nearTableHits, hashFallbackHits, farClipmapHits, missingSamples };
+      return sunBlockedResult(false, steps, counters, "dense");
     }
 
-    const chunkSize = state.config.world.chunkSizeCells;
-    const key = worldToChunkKey(x, z, chunkSize);
-    const lookup = lookupValidatedChunkIndex(state.nearTable, state.hashFallback, state.residents, key);
-    let skip = cellSize;
-
-    const dist = Math.hypot(x - state.cameraX, z - state.cameraZ);
-    const mipLevel = mipLevelForDistance(
-      dist,
-      chunkSize,
-      cellSize,
-      state.config.query.sunLodBias,
+    const nextTravel = Math.min(maxDistanceM, traveled + stepDistance);
+    const segmentDistance = nextTravel - traveled;
+    const nextProbe = samplePrimaryProbe(
+      state,
+      counters,
+      probe.x + sunDirX * segmentDistance,
+      probe.y + sunDirY * segmentDistance,
+      probe.z + sunDirZ * segmentDistance,
+      "shadow",
     );
 
-    if (lookup.index >= 0) {
-      const entry = state.residents[lookup.index];
-      const mipChain = entry ? activeMipChain(entry) : null;
-      if (mipChain) {
-        const local = worldToLocalCell(x, z, key, chunkSize);
-        const node = sampleMipNodeAtWorld(mipChain, local.localX, local.localZ, mipLevel, chunkSize);
-        if (node) {
-          const sunResult = sunNodeBlocksRay(node, y, state.config);
-          if (sunResult === "blocked") {
-            state.metrics.sunSteps.add(steps);
-            state.metrics.aadfSkips += aadfSkips;
-            return { visible: false, unknown: false, blocked: true, steps, aadfSkips, nearTableHits, hashFallbackHits, farClipmapHits, missingSamples };
-          }
-          if (sunResult === "visible" && !nodeRequiresRefine(node, state.config)) {
-            skip = estimateSafeSkipDistance({
-              node,
-              rayDirX: sunDirX,
-              rayDirY: sunDirY,
-              rayDirZ: sunDirZ,
-              cellSizeM: cellSize,
-              nextCellBoundaryDistanceM: cellSize,
-              epsilonM: eps,
-              config: state.config,
-            });
-            if (aadfSkipOccurred(skip, cellSize)) aadfSkips++;
-            x += sunDirX * skip;
-            y += sunDirY * skip;
-            z += sunDirZ * skip;
-            traveled += skip;
-            continue;
-          }
-        }
-      }
+    if (nextProbe.terrain.unknown && state.config.query.unknownCountsAsBlockedForSun) {
+      state.metrics.unknownSunSamples++;
+      state.metrics.sunSteps.add(steps);
+      return sunBlockedResult(true, steps, counters, "dense");
+    }
+    if (nextProbe.y <= nextProbe.terrain.height) {
+      refinePrimaryCrossing(state, counters, probe, nextProbe, "shadow");
+      state.metrics.sunSteps.add(steps);
+      return sunBlockedResult(false, steps, counters, "dense");
     }
 
-    x += sunDirX * eps;
-    y += sunDirY * eps;
-    z += sunDirZ * eps;
-    traveled += eps;
+    traveled = nextTravel;
+    probe = nextProbe;
   }
 
   state.metrics.sunSteps.add(steps);
-  state.metrics.aadfSkips += aadfSkips;
-  return { visible: true, unknown: missingSamples > 0, blocked: false, steps, aadfSkips, nearTableHits, hashFallbackHits, farClipmapHits, missingSamples };
+  return { visible: true, unknown: counters.missingSamples > 0, blocked: false, steps, aadfSkips: 0, nearTableHits: counters.nearTableHits, hashFallbackHits: counters.hashFallbackHits, farClipmapHits: counters.farClipmapHits, missingSamples: counters.missingSamples, traversalMode: "dense" };
 }
 
-function emptyRayResult(): RayTraceResult {
+function samplePrimaryProbe(
+  state: NaadfWorldState,
+  counters: LocalCounters,
+  x: number,
+  y: number,
+  z: number,
+  purpose: QueryPurpose,
+): PrimaryProbe {
+  const terrain = queryTerrainHeight({ state, worldX: x, worldZ: z, purpose });
+  recordLocalCounters(counters, terrain);
+  return { x, y, z, terrain };
+}
+
+function refinePrimaryCrossing(
+  state: NaadfWorldState,
+  counters: LocalCounters,
+  start: PrimaryProbe,
+  end: PrimaryProbe,
+  purpose: QueryPurpose,
+): PrimaryProbe {
+  let low = start;
+  let high = end;
+  for (let i = 0; i < ORACLE_REFINE_STEPS; i++) {
+    const mid = samplePrimaryProbe(
+      state,
+      counters,
+      (low.x + high.x) * 0.5,
+      (low.y + high.y) * 0.5,
+      (low.z + high.z) * 0.5,
+      purpose,
+    );
+    if (mid.y <= mid.terrain.height) high = mid;
+    else low = mid;
+  }
+  return high;
+}
+
+function primaryHitResult(
+  probe: PrimaryProbe,
+  steps: number,
+  counters: LocalCounters,
+  traversalMode: "dense",
+): RayTraceResult {
+  return {
+    hit: true,
+    unknown: probe.terrain.unknown,
+    hitX: probe.x,
+    hitY: probe.terrain.height,
+    hitZ: probe.z,
+    material: probe.terrain.material,
+    steps,
+    aadfSkips: 0,
+    nearTableHits: counters.nearTableHits,
+    hashFallbackHits: counters.hashFallbackHits,
+    farClipmapHits: counters.farClipmapHits,
+    missingSamples: counters.missingSamples,
+    traversalMode,
+  };
+}
+
+function sunBlockedResult(
+  unknown: boolean,
+  steps: number,
+  counters: LocalCounters,
+  traversalMode: "dense",
+): SunVisibilityResult {
+  return { visible: false, unknown, blocked: true, steps, aadfSkips: 0, nearTableHits: counters.nearTableHits, hashFallbackHits: counters.hashFallbackHits, farClipmapHits: counters.farClipmapHits, missingSamples: counters.missingSamples, traversalMode };
+}
+
+function withIsolatedMetrics<T>(state: NaadfWorldState, run: () => T): T {
+  const originalMetrics = state.metrics;
+  state.metrics = new NaadfMetricsCollector();
+  try {
+    return run();
+  } finally {
+    state.metrics = originalMetrics;
+  }
+}
+
+function createLocalCounters(): LocalCounters {
+  return { nearTableHits: 0, hashFallbackHits: 0, farClipmapHits: 0, missingSamples: 0 };
+}
+
+function recordLocalCounters(counters: LocalCounters, terrain: TerrainQueryResult): void {
+  if (terrain.nearTableHit) counters.nearTableHits++;
+  if (terrain.hashFallbackHit) counters.hashFallbackHits++;
+  if (terrain.farClipmapHit) counters.farClipmapHits++;
+  if (terrain.unknown || terrain.missingSample) counters.missingSamples++;
+}
+
+function emptyRayResult(traversalMode: "dense"): RayTraceResult {
   return {
     hit: false,
     unknown: true,
@@ -455,5 +489,6 @@ function emptyRayResult(): RayTraceResult {
     hashFallbackHits: 0,
     farClipmapHits: 0,
     missingSamples: 1,
+    traversalMode,
   };
 }

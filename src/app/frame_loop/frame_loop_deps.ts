@@ -96,6 +96,7 @@ export interface FrameLoopVegetationDeps {
 
 export interface FrameLoopWaterWeatherDeps {
   waterController: WaterController;
+  deepOceanSurface: import("../../water/deep_ocean_surface.js").DeepOceanSurface | null;
   deepOceanMaterial: import("../../water/deep_ocean_material.js").DeepOceanMaterialHandle | null;
   waterField: import("../../water/waterField.js").WaterField;
   deepOceanConfig: import("../../terrain/border_coast_config.js").DeepOceanRenderConfig;
@@ -158,6 +159,15 @@ export interface FrameLoopCanopyDeps {
   update: (cameraX: number, cameraZ: number) => void;
 }
 
+export interface FrameLoopConstructionDeps {
+  update: () => void;
+  isActive: () => boolean;
+}
+
+export interface FrameLoopCombatDeps {
+  update: (timeMs: number) => void;
+}
+
 export interface ClodFrameLoopDeps {
   render: FrameLoopRenderDeps;
   player: FrameLoopPlayerDeps;
@@ -169,4 +179,6 @@ export interface ClodFrameLoopDeps {
   farSummary?: FrameLoopFarSummaryDeps;
   shadowProxy?: FrameLoopShadowProxyDeps;
   canopy?: FrameLoopCanopyDeps;
+  construction?: FrameLoopConstructionDeps;
+  combat?: FrameLoopCombatDeps;
 }

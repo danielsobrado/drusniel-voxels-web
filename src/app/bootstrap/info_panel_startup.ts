@@ -3,6 +3,7 @@ import { formatTreeInfoLine } from "../../trees/index.js";
 import { formatUnderstoryInfoLine } from "../../understory/index.js";
 import { formatForestLightingInfoLine } from "../../forest_lighting/index.js";
 import { updateClodOverlay, type ClodOverlaySnapshot } from "../../ui/overlay_panel.js";
+import { createStreamDiagnosticTracker } from "../../stream/stream_diagnostics.js";
 import type { UiStartupContext } from "./ui_startup_context.js";
 
 export interface InfoPanelController {
@@ -46,6 +47,13 @@ export function createInfoPanelController(ctx: UiStartupContext): InfoPanelContr
     grassSystem,
   } = input.runtime;
   const { colorByLodUserOverride } = input;
+  const streamDiagnostics = createStreamDiagnosticTracker({
+    cfg: input.cfg,
+    maxTerrainLevel: input.maxTerrainLevel,
+    phase0Config: input.longView.phase0Config,
+    phase0TargetVisibleM: input.longView.phase0TargetVisibleM,
+    queryScene: input.longView.queryScene,
+  });
 
   const setPerfModeQuery = (enabled: boolean) => {
     const next = new URLSearchParams(location.search);
@@ -73,6 +81,9 @@ export function createInfoPanelController(ctx: UiStartupContext): InfoPanelContr
 
   const updateInfo = () => {
     const selection = selectionController.stats();
+    const streamLine = input.longView.isLongView
+      ? `${streamDiagnostics.format(streamDiagnostics.update({ x: input.camera.position.x, z: input.camera.position.z }))}\n`
+      : "";
     session.parentsHealthy = clodWorker.isParentsHealthy();
     const lastErr = clodWorker.getLastParentError();
     session.lastParentError = lastErr ? lastErr.message : "";
@@ -88,6 +99,7 @@ export function createInfoPanelController(ctx: UiStartupContext): InfoPanelContr
       `threshold: ${state.thresholdPx.toFixed(2)} px   avg FPS: ${session.averageFpsRef.value.toFixed(1)}   ` +
       `${state.forceMaxLevel === "auto" ? "" : `forced<=${state.forceMaxLevel}   `}${state.freeze ? "[FROZEN]" : ""}\n` +
       `renderer: ${isWebGpu ? "WebGPU" : "WebGL"}   selection: ${selection.selectionSource} ${selection.selectionMs.toFixed(2)}ms   gpu-compute: ${selectionController.formatWebGpuStats(state.webgpuSelection)}\n` +
+      streamLine +
       `${polishLine}\n` +
       `worker: parents pending=${session.pendingParentCount} rebuilt=${session.pendingParentNodes} ${session.pendingParentMs.toFixed(0)}ms` +
       `${session.parentsHealthy ? "" : `  PARENT FAIL: ${session.lastParentError}`}   ` +

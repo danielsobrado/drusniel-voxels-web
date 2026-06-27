@@ -6,7 +6,7 @@ import type {
   Lod0RebuildResult,
   NodeBuildStat,
 } from "./clod/quadtree.js";
-import type { DigEdit } from "./terrain/terrain.js";
+import type { DigEdit, VoxelEditSnapshot } from "./terrain/terrain.js";
 import type { BorderCoastOceanConfig } from "./terrain/border_coast_config.js";
 import type { ClodPageNode, PageFootprint, PageMesh } from "./types.js";
 import type { TerrainSourceInputs } from "./cache/terrainSource.js";
@@ -45,7 +45,7 @@ export type ClodWorkerRequest =
       worldPagesX: number;
       worldPagesZ: number;
       cfg: ClodPagesConfig;
-      edits: DigEdit[];
+      voxelEdits: VoxelEditSnapshot;
       hydrologyTerrain?: SerializedHydrologyTerrain | null;
       borderCoastOceanConfig?: BorderCoastOceanConfig | null;
       cacheDisabled?: boolean;
@@ -56,7 +56,7 @@ export type ClodWorkerRequest =
       type: "dig";
       requestId: number;
       edits: DigEdit[];
-      dirty: DirtyCellBounds;
+      dirtyRegions: DirtyCellBounds[];
     }
   | {
       type: "flush";
@@ -69,6 +69,7 @@ export type ClodWorkerRequest =
 
 export interface SerializedLod0RebuildResult {
   requestIds: number[];
+  editCount: number;
   changed: SerializedClodNode[];
   dirtyCoords: [number, number][];
   lod0Pages: number;
@@ -135,6 +136,7 @@ export function serializeNodes(nodes: readonly ClodPageNode[]): SerializedClodNo
 export function serializeLod0Rebuild(result: Lod0RebuildResult, pendingParents: number, serializeMs: number, serializedBytes: number): SerializedLod0RebuildResult {
   return {
     requestIds: [0],
+    editCount: 1,
     changed: serializeNodes(result.changed),
     dirtyCoords: result.dirtyCoords.map(([x, z]) => [x, z]),
     lod0Pages: result.lod0Pages,
@@ -220,17 +222,17 @@ export function rehydrateBuildResult(serialized: SerializedBuildResult): BuildRe
     nodesByLevel.set(level, nodes);
   }
 
-  for (const [, serializedNodes] of serialized.nodesByLevel) {
-    for (const serializedNode of serializedNodes) {
-      const node = nodesById.get(serializedNode.id);
-      if (node) applySerializedNode(node, serializedNode, nodesById);
+  for (const [, nodes] of nodesByLevel) {
+    for (const node of nodes) {
+      const serializedNode = serialized.nodesByLevel.flatMap(([, levelNodes]) => levelNodes).find((n) => n.id === node.id);
+      node.children = serializedNode?.childIds.map((id) => (id === null ? null : nodesById.get(id) ?? null)) ?? [];
     }
   }
 
   return {
     roots: serialized.roots.map((id) => nodesById.get(id)).filter((node): node is ClodPageNode => !!node),
     nodesByLevel,
-    stats: serialized.stats,
+    stats: serialized.stats.map((stat) => ({ ...stat, polish: { ...stat.polish } })),
     worldPagesX: serialized.worldPagesX,
     worldPagesZ: serialized.worldPagesZ,
   };

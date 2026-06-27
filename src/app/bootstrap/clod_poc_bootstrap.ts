@@ -1,4 +1,4 @@
-﻿import phase0ConfigText from "../../../config/infinite_streaming_phase0.yaml?raw";
+import phase0ConfigText from "../../../config/infinite_streaming_phase0.yaml?raw";
 import naadfConfigText from "../../../config/naadf_poc.yaml?raw";
 import { installGlobalErrorHooks } from "../../core/diagnostics.js";
 import { parseClodRuntimeConfig } from "../runtime_config.js";
@@ -21,9 +21,9 @@ import { InfiniteFarShell, createFarShellMetrics, createDefaultLongViewConfig, l
 import type { FarShellMetrics } from "../../long-view/index.js";
 import { loadLongViewMaterialsConfig, parseQueryOverrides } from "../../config/longViewMaterialsConfig.js";
 import { configToUniformData } from "../../farTerrain/farTerrainUniforms.js";
+import { applyOwnershipToFarShellRange, resolveStreamingOwnership } from "../../streaming/streaming_ownership.js";
 import { RIVER_PARITY_TEST_SCENE } from "../../water/riverParityScene.js";
 import * as THREE from "three";
-
 
 export async function bootstrapClodPoc() {
   const searchParams = new URLSearchParams(location.search);
@@ -133,6 +133,12 @@ export async function bootstrapClodPoc() {
 
   const queryScene = queries.queryScene;
   const isNaadfCapable = queries.queryNaadfScene;
+  const streamingOwnership = resolveStreamingOwnership({
+    streaming: queries.phase0Streaming,
+    targetVisibleM: queries.phase0TargetVisibleM,
+    targetFutureVisibleM: queries.phase0Config.phase0.target_future_visible_m,
+    streamingScene: queryScene?.startsWith("infinite-") ?? false,
+  });
 
   if (isNaadfCapable) {
     naadfIntegration = initNaadfIntegration({
@@ -147,6 +153,9 @@ export async function bootstrapClodPoc() {
     naadfIntegration?.config.farShell.useNaadfSummary
     && (queryScene?.startsWith("infinite-naadf-") ?? false),
   );
+  const naadfHeightSamplingMode = useNaadfFarSummary
+    ? naadfIntegration?.config.farShell.heightSamplingMode
+    : undefined;
 
   const isLongViewCapableScene =
     queryScene === "infinite-stream-far-summary" ||
@@ -184,8 +193,11 @@ export async function bootstrapClodPoc() {
       lvConfig.farShell.endMeters = naadfIntegration.config.farShell.endM;
       if (naadfIntegration.config.farShell.gridRes > 0) {
         lvConfig.farShell.radialSegments = naadfIntegration.config.farShell.gridRes;
+        lvConfig.farShell.angularSegments = naadfIntegration.config.farShell.gridRes;
       }
     }
+
+    applyOwnershipToFarShellRange(lvConfig.farShell, streamingOwnership);
 
     farShellMetrics = createFarShellMetrics();
     farShellMetrics.farShellEnabled = true;
@@ -212,14 +224,28 @@ export async function bootstrapClodPoc() {
     const heightProvider = useNaadfFarSummary && naadfIntegration
       ? naadfIntegration.getHeightProvider()
       : farSummaryIntegration?.getHeightProvider();
-    if (!heightProvider) {
-      throw new Error("long-view scene requires NAADF or far-summary height provider");
-    }
     const lighting = terrainView.currentLighting();
 
     const materialConfig = loadLongViewMaterialsConfig(undefined, parseQueryOverrides(searchParams));
     const parityConfig = materialConfig.enabled ? configToUniformData(materialConfig) : undefined;
     const useParity = materialConfig.enabled && parityConfig !== undefined;
+    const farSummaryGpuAtlas = naadfHeightSamplingMode === "gpu"
+      ? naadfIntegration?.getFarSummaryGpuAtlasView()
+      : undefined;
+
+    if (naadfHeightSamplingMode === "gpu" && !useParity) {
+      throw new Error("NAADF GPU height mode requires the WebGPU parity far terrain material");
+    }
+    if (naadfHeightSamplingMode === "gpu" && !farSummaryGpuAtlas) {
+      throw new Error("NAADF GPU height mode requires a far-summary GPU atlas");
+    }
+
+    const effectiveHeightSamplingMode = naadfHeightSamplingMode === "gpu"
+      ? "gpu"
+      : naadfHeightSamplingMode;
+    if (!heightProvider && effectiveHeightSamplingMode !== "gpu") {
+      throw new Error("long-view scene requires NAADF or far-summary height provider");
+    }
 
     infiniteFarShell = new InfiniteFarShell({
       innerMeters: lvConfig.farShell.startMeters,
@@ -240,6 +266,8 @@ export async function bootstrapClodPoc() {
       },
       useParityMaterial: useParity,
       parityConfig,
+      heightSamplingMode: effectiveHeightSamplingMode,
+      farSummaryGpuAtlas: effectiveHeightSamplingMode === "gpu" ? farSummaryGpuAtlas : undefined,
       debugShowMissingFallback: lvConfig.debug.showMissingSummaryFallback,
       metrics: farShellMetrics,
     });
@@ -280,6 +308,7 @@ export async function bootstrapClodPoc() {
     borderCoastOceanConfig: world.borderCoastOceanConfig,
     customPropsConfig: world.customPropsConfig,
     propPlacementScenes: world.propPlacementScenes,
+    stagedImport,
     queryGrassRingGrid: queries.queryGrassRingGrid,
     queryGrassRingCell: queries.queryGrassRingCell,
     isWebGpu: renderer.isWebGpu,

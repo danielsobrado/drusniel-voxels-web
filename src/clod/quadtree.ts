@@ -10,8 +10,8 @@
 
 import { ClodPageNode, PageFootprint, PageMesh, ClodBuildError } from "../types.js";
 import { ClodPagesConfig } from "../config.js";
-import { buildLod0PageSource, rebuildPageChunks } from "./source_mesh.js";
-import { concat } from "./source_mesh.js";
+import { buildLod0PageSource, dirtyPageChunkIndices, rebuildPageChunks } from "./source_mesh.js";
+import { concatPageSourceMeshes as concat } from "./pageSource.js";
 import { weldVertices } from "./weld.js";
 import { buildOuterBorderLocks, countLocks } from "../lock.js";
 import { simplifyPage, type SimplifyOutput } from "./simplify.js";
@@ -94,7 +94,31 @@ function simplifyParentPage(
     assertNoInternalBorders(sim.mesh, footprint);
     return sim;
   } catch {
-    return { mesh: welded, resultError: 0, errorWorld: 0, lowBenefit: true };
+    try {
+      assertNoInternalBorders(welded, footprint);
+      return { mesh: welded, resultError: 0, errorWorld: 0, lowBenefit: true };
+    } catch {
+      // Hydrology merge can leave seams on the welded parent while simplification still
+      // produces the cleaner mesh — prefer simplified over welded when both fail the check.
+      return { mesh: sim.mesh, resultError: sim.resultError, errorWorld: sim.errorWorld, lowBenefit: true };
+    }
+  }
+}
+
+/** Diagonal polish is optional quality; skip when a flip would open an internal seam. */
+function tryPolishParentPage(
+  mesh: PageMesh,
+  footprint: PageFootprint,
+  cfg: ClodPagesConfig,
+  label: string,
+): { mesh: PageMesh; stats: ReturnType<typeof emptyDiagonalPolishStats> } {
+  const candidate = clonePageMesh(mesh);
+  const stats = polishDiagonals(candidate, buildOuterBorderLocks(candidate), pageMeshPolishConfig(cfg));
+  try {
+    validateFinalPageMesh(candidate, footprint, cfg.validation.zero_area_epsilon, `${label} polish`);
+    return { mesh: candidate, stats };
+  } catch {
+    return { mesh, stats: emptyDiagonalPolishStats() };
   }
 }
 
@@ -238,12 +262,15 @@ export function buildWorld(worldPagesX: number, worldPagesZ: number, cfg: ClodPa
         const locks = buildOuterBorderLocks(welded);
         const sim = simplifyParentPage(welded, locks, footprint, cfg);
         const simplified = sim.mesh !== welded;
+        let polish = emptyDiagonalPolishStats();
         if (simplified) {
           validateWeldedIntermediate(sim.mesh, `L${level}:${nx},${nz} after simplify`, cfg.validation.zero_area_epsilon);
+          if (level === maxLevels - 1) {
+            const polished = tryPolishParentPage(sim.mesh, footprint, cfg, `L${level}:${nx},${nz}`);
+            sim.mesh = polished.mesh;
+            polish = polished.stats;
+          }
         }
-        const polish = simplified
-          ? polishDiagonals(sim.mesh, buildOuterBorderLocks(sim.mesh), pageMeshPolishConfig(cfg))
-          : emptyDiagonalPolishStats();
         validateFinalPageMesh(sim.mesh, footprint, cfg.validation.zero_area_epsilon, `L${level}:${nx},${nz} final`);
 
         const errorWorld = sim.errorWorld + Math.max(...children.map((c) => c.errorWorld));
@@ -418,12 +445,15 @@ export async function buildWorldAsync(
         const locks = buildOuterBorderLocks(welded);
         const sim = simplifyParentPage(welded, locks, footprint, cfg);
         const simplified = sim.mesh !== welded;
+        let polish = emptyDiagonalPolishStats();
         if (simplified) {
           validateWeldedIntermediate(sim.mesh, `L${level}:${nx},${nz} after simplify`, cfg.validation.zero_area_epsilon);
+          if (level === maxLevels - 1) {
+            const polished = tryPolishParentPage(sim.mesh, footprint, cfg, `L${level}:${nx},${nz}`);
+            sim.mesh = polished.mesh;
+            polish = polished.stats;
+          }
         }
-        const polish = simplified
-          ? polishDiagonals(sim.mesh, buildOuterBorderLocks(sim.mesh), pageMeshPolishConfig(cfg))
-          : emptyDiagonalPolishStats();
         validateFinalPageMesh(sim.mesh, footprint, cfg.validation.zero_area_epsilon, `L${level}:${nx},${nz} final`);
 
         const errorWorld = sim.errorWorld + Math.max(...children.map((c) => c.errorWorld));
@@ -501,13 +531,13 @@ export function buildNodeIndex(result: BuildResult): NodeIndex {
 }
 
 export interface Lod0RebuildResult {
-  /** LOD0 nodes re-extracted from the field, mutated in place. */
+  /** LOD0 nodes whose mesh/chunk cache changed, mutated in place. */
   changed: ClodPageNode[];
-  /** Page coords of the rebuilt LOD0 nodes — the seed for the ancestor chain. */
+  /** Page coords of changed LOD0 nodes — the seed for the ancestor chain. */
   dirtyCoords: [number, number][];
   lod0Pages: number;
   lod0Ms: number;
-  /** Chunks actually re-meshed vs. the chunks in the dirty pages (the per-chunk saving). */
+  /** Chunks actually re-meshed vs. the chunks considered in the sibling page group. */
   chunksRemeshed: number;
   chunksTotal: number;
 }
@@ -518,12 +548,52 @@ export interface Lod0RebuildResult {
  * chain and it's the surface the player is looking at, so the viewer applies this
  * synchronously and defers {@link resimplifyParent} to later frames.
  */
+/** When any page at `level` in a 2x2 parent quad is dirty, include all four siblings. */
+export function expandQuadSiblingPages(
+  coords: readonly [number, number][],
+  level: number,
+  worldPagesX: number,
+  worldPagesZ: number,
+): [number, number][] {
+  const maxX = (worldPagesX >> level) - 1;
+  const maxZ = (worldPagesZ >> level) - 1;
+  const keys = new Set<string>();
+  for (const [nx, nz] of coords) {
+    const parentX = nx >> 1;
+    const parentZ = nz >> 1;
+    const baseX = parentX * 2;
+    const baseZ = parentZ * 2;
+    for (let dz = 0; dz < 2; dz++) {
+      for (let dx = 0; dx < 2; dx++) {
+        const px = baseX + dx;
+        const pz = baseZ + dz;
+        if (px < 0 || pz < 0 || px > maxX || pz > maxZ) continue;
+        keys.add(`${px},${pz}`);
+      }
+    }
+  }
+  return [...keys].map((k) => {
+    const [px, pz] = k.split(",").map(Number);
+    return [px, pz] as [number, number];
+  });
+}
+
+/** @deprecated Use {@link expandQuadSiblingPages} at level 0. */
+export function expandLod0SiblingPages(
+  coords: readonly [number, number][],
+  worldPagesX: number,
+  worldPagesZ: number,
+): [number, number][] {
+  return expandQuadSiblingPages(coords, 0, worldPagesX, worldPagesZ);
+}
+
 export function rebuildDirtyLod0Pages(
   result: BuildResult,
   dirty: DirtyCellBounds,
   cfg: ClodPagesConfig,
   index: NodeIndex,
 ): Lod0RebuildResult {
+  const pageChunks = cfg.page.chunks_per_page ** 2;
   const span = cfg.page.chunks_per_page * cfg.page.chunk_size;
   const world = {
     cellsX: result.worldPagesX * span,
@@ -535,41 +605,69 @@ export function rebuildDirtyLod0Pages(
   const minPz = Math.max(0, Math.floor(dirty.minZ / span));
   const maxPz = Math.min(result.worldPagesZ - 1, Math.floor(dirty.maxZ / span));
 
+  const touched: [number, number][] = [];
+  for (let pz = minPz; pz <= maxPz; pz++) {
+    for (let px = minPx; px <= maxPx; px++) {
+      touched.push([px, pz]);
+    }
+  }
+  const pages = expandQuadSiblingPages(touched, 0, result.worldPagesX, result.worldPagesZ);
+
   const changed: ClodPageNode[] = [];
   const dirtyCoords: [number, number][] = [];
   let chunksRemeshed = 0;
   let chunksTotal = 0;
   const t0 = performance.now();
-  for (let pz = minPz; pz <= maxPz; pz++) {
-    for (let px = minPx; px <= maxPx; px++) {
-      const node = index[0]?.get(`${px},${pz}`);
-      if (!node) continue;
-      let mesh: PageMesh;
-      if (node.chunkMeshes) {
-        // re-mesh only the chunks the edit perturbs, then re-weld the page (== full rebuild)
-        const r = rebuildPageChunks(node.chunkMeshes, px, pz, cfg, world, dirty);
-        mesh = r.mesh;
-        chunksRemeshed += r.remeshed;
-        chunksTotal += node.chunkMeshes.length;
-      } else {
-        // Warm-cache LOD0 pages omit chunkMeshes; first edit does one full page extract, then partial chunk remeshing.
-        const src = buildLod0PageSource(px, pz, cfg, world);
-        node.chunkMeshes = src.chunks;
-        mesh = src.mesh;
-        chunksRemeshed += src.chunks.length;
-        chunksTotal += src.chunks.length;
-      }
-      validatePageMesh(mesh, node.footprint, cfg.validation.zero_area_epsilon, `L0:${px},${pz} edit-rebuild`);
-      node.mesh = mesh;
-      node.bounds = boundsOf(mesh);
-      changed.push(node);
-      dirtyCoords.push([px, pz]);
+  for (const [px, pz] of pages) {
+    const node = index[0]?.get(`${px},${pz}`);
+    if (!node) continue;
+    const dirtyChunkCount = dirtyPageChunkIndices(px, pz, cfg, dirty).length;
+    chunksTotal += node.chunkMeshes?.length ?? pageChunks;
+    if (dirtyChunkCount === 0) continue;
+
+    let mesh: PageMesh;
+    if (node.chunkMeshes) {
+      const r = rebuildPageChunks(node.chunkMeshes, px, pz, cfg, world, dirty);
+      if (r.remeshed === 0) continue;
+      mesh = r.mesh;
+      chunksRemeshed += r.remeshed;
+    } else {
+      const src = buildLod0PageSource(px, pz, cfg, world);
+      node.chunkMeshes = src.chunks;
+      mesh = src.mesh;
+      chunksRemeshed += src.chunks.length;
     }
+    validatePageMesh(mesh, node.footprint, cfg.validation.zero_area_epsilon, `L0:${px},${pz} edit-rebuild`);
+    node.mesh = mesh;
+    node.bounds = boundsOf(mesh);
+    changed.push(node);
+    dirtyCoords.push([px, pz]);
   }
   return {
     changed, dirtyCoords, lod0Pages: changed.length, lod0Ms: performance.now() - t0,
     chunksRemeshed, chunksTotal,
   };
+}
+
+/** Re-extract one LOD0 page from the current voxel field (used before parent merges). */
+function refreshLod0PageFromField(
+  index: NodeIndex,
+  key: string,
+  cfg: ClodPagesConfig,
+  result: BuildResult,
+): void {
+  const node = index[0]?.get(key);
+  if (!node) return;
+  const span = cfg.page.chunks_per_page * cfg.page.chunk_size;
+  const [px, pz] = key.split(",").map(Number);
+  const world = {
+    cellsX: result.worldPagesX * span,
+    cellsZ: result.worldPagesZ * span,
+  };
+  const src = buildLod0PageSource(px, pz, cfg, world);
+  node.chunkMeshes = src.chunks;
+  node.mesh = src.mesh;
+  node.bounds = boundsOf(src.mesh);
 }
 
 /**
@@ -600,7 +698,10 @@ export function resimplifyParent(
   const simplified = sim.mesh !== welded;
   if (simplified) {
     validateWeldedIntermediate(sim.mesh, `${node.id} resimplify`, cfg.validation.zero_area_epsilon);
-    polishDiagonals(sim.mesh, buildOuterBorderLocks(sim.mesh), pageMeshPolishConfig(cfg));
+    if (node.level >= cfg.page.quadtree_levels - 1) {
+      const polished = tryPolishParentPage(sim.mesh, node.footprint, cfg, node.id);
+      sim.mesh = polished.mesh;
+    }
   }
   validateFinalPageMesh(sim.mesh, node.footprint, cfg.validation.zero_area_epsilon, `${node.id} final`);
   node.mesh = sim.mesh;
@@ -608,6 +709,64 @@ export function resimplifyParent(
   node.errorWorld = sim.errorWorld + Math.max(...children.map((c) => c.errorWorld));
   node.lowBenefit = sim.lowBenefit;
   return node;
+}
+
+export interface AncestorRebuildResult {
+  changed: ClodPageNode[];
+  parentNodes: number;
+  parentMs: number;
+}
+
+/** Re-simplify every ancestor touched by a LOD0 dirty set, expanding 2x2 siblings at each level. */
+export function rebuildAncestorLevels(
+  result: BuildResult,
+  lod0DirtyCoords: readonly [number, number][],
+  index: NodeIndex,
+  cfg: ClodPagesConfig,
+): AncestorRebuildResult {
+  const changed: ClodPageNode[] = [];
+  const t0 = performance.now();
+  let parentNodes = 0;
+  const topLevel = Math.max(...result.nodesByLevel.keys());
+  const seed = new Set<string>();
+  for (const [nx, nz] of lod0DirtyCoords) seed.add(`${nx >> 1},${nz >> 1}`);
+  let levelCoords = [...seed].map((k) => k.split(",").map(Number) as [number, number]);
+
+  for (let level = 1; level <= topLevel && levelCoords.length > 0; level++) {
+    levelCoords = expandQuadSiblingPages(levelCoords, level, result.worldPagesX, result.worldPagesZ);
+    if (level === 1) {
+      const l0Keys = new Set<string>();
+      for (const [nx, nz] of levelCoords) {
+        const baseX = nx * 2;
+        const baseZ = nz * 2;
+        for (let dz = 0; dz < 2; dz++) {
+          for (let dx = 0; dx < 2; dx++) {
+            l0Keys.add(`${baseX + dx},${baseZ + dz}`);
+          }
+        }
+      }
+      for (const key of l0Keys) {
+        refreshLod0PageFromField(index, key, cfg, result);
+      }
+    }
+    const parentKeys = new Set<string>();
+    const nextCoords: [number, number][] = [];
+    for (const [nx, nz] of levelCoords) {
+      const key = `${nx},${nz}`;
+      const node = resimplifyParent(index, level, key, cfg);
+      if (!node) continue;
+      changed.push(node);
+      parentNodes++;
+      const pk = `${nx >> 1},${nz >> 1}`;
+      if (!parentKeys.has(pk)) {
+        parentKeys.add(pk);
+        nextCoords.push([nx >> 1, nz >> 1]);
+      }
+    }
+    levelCoords = nextCoords;
+  }
+
+  return { changed, parentNodes, parentMs: performance.now() - t0 };
 }
 
 /**
@@ -624,25 +783,12 @@ export function rebuildDirtyPages(
 ): EditRebuildResult {
   const index = buildNodeIndex(result);
   const lod0 = rebuildDirtyLod0Pages(result, dirty, cfg, index);
-  const changed = [...lod0.changed];
-
-  const t1 = performance.now();
-  let parentNodes = 0;
-  const topLevel = Math.max(...result.nodesByLevel.keys());
-  let dirtyCoords = lod0.dirtyCoords;
-  for (let level = 1; level <= topLevel && dirtyCoords.length > 0; level++) {
-    const parents = new Map<string, [number, number]>();
-    for (const [nx, nz] of dirtyCoords) parents.set(`${nx >> 1},${nz >> 1}`, [nx >> 1, nz >> 1]);
-    dirtyCoords = [];
-    for (const [key, coord] of parents) {
-      const node = resimplifyParent(index, level, key, cfg);
-      if (!node) continue;
-      changed.push(node);
-      parentNodes++;
-      dirtyCoords.push(coord);
-    }
-  }
-  const parentMs = performance.now() - t1;
-
-  return { changed, lod0Pages: lod0.lod0Pages, parentNodes, lod0Ms: lod0.lod0Ms, parentMs };
+  const ancestors = rebuildAncestorLevels(result, lod0.dirtyCoords, index, cfg);
+  return {
+    changed: [...lod0.changed, ...ancestors.changed],
+    lod0Pages: lod0.lod0Pages,
+    parentNodes: ancestors.parentNodes,
+    lod0Ms: lod0.lod0Ms,
+    parentMs: ancestors.parentMs,
+  };
 }

@@ -8,7 +8,7 @@ import type { Phase0Config } from "../../phase0/phase0_config.js";
 import type { TerrainRaycastService } from "../../player/terrain_raycast_service.js";
 import type { TerrainColliderSet } from "../../terrain/terrain_collider.js";
 import type { PlayerController, PlayerInteractionState } from "../../player_controller.js";
-import type { ProjectArchiveContents } from "../../project/project_archive.js";
+import type { VoxelProjectArchiveContents } from "../../project/voxel_project_archive.js";
 import type { TerrainTextureLoadOptions } from "../../terrain/material/texture_loader.js";
 import type { VegetationDirtyQueue } from "../../systems/vegetation_dirty.js";
 import type { ClodAppState } from "../clod_app_state.js";
@@ -23,6 +23,7 @@ import type { parseUnderstoryConfig } from "../../understory/understory_config.j
 import type { GuiDisplayController } from "./bootstrap_refs.js";
 import type { createPlayerInputController } from "../../player/player_input_controller.js";
 import type { createPlayerModeController } from "../../player/player_mode_controller.js";
+import type { SwordAttackController } from "../../combat/index.js";
 
 export interface UiStartupInput {
   dom: DomShell;
@@ -32,7 +33,7 @@ export interface UiStartupInput {
   WORLD: number;
   polishLine: string;
   buildStatusRef: { value: string };
-  stagedImport: ProjectArchiveContents | null;
+  stagedImport: VoxelProjectArchiveContents | null;
   state: ClodAppState;
   bindings: ClodRuntimeBindings;
   colorByLodUserOverride: { value: boolean };
@@ -76,7 +77,6 @@ export interface UiStartupInput {
     infiniteFarShell?: import("../../long-view/infiniteFarShell.js").InfiniteFarShell;
     farShellMetrics?: import("../../long-view/farShellMetrics.js").FarShellMetrics;
   };
-  /** Optional far summary frame update callback. */
   onFarSummaryUpdate?: (frameIndex: number, deltaSeconds: number, camera: THREE.PerspectiveCamera) => void;
   naadfIntegration?: import("../../naadf/integration.js").NaadfIntegration;
   getClodErrorCompute: () => import("../../gpu/clod_error_px_compute.js").ClodErrorPxCompute | null;
@@ -95,6 +95,8 @@ export interface UiSessionState {
   pendingParentNodes: number;
   pendingParentMs: number;
   pendingParentCount: number;
+  terraformEditActive: boolean;
+  constructionBuildActive: boolean;
   terraformEditCheckbox: HTMLInputElement | null;
   weatherStatsController: GuiDisplayController | null;
   naadfStatsController: GuiDisplayController | null;
@@ -106,6 +108,7 @@ export interface UiSessionState {
   digRadiusController: GuiDisplayController | null;
   playerInputController: ReturnType<typeof createPlayerInputController> | null;
   playerModeController: ReturnType<typeof createPlayerModeController> | null;
+  combatController: SwordAttackController | null;
 }
 
 export interface UiStartupContext {
@@ -125,6 +128,8 @@ export function createUiStartupContext(input: UiStartupInput): UiStartupContext 
       pendingParentNodes: 0,
       pendingParentMs: 0,
       pendingParentCount: 0,
+      terraformEditActive: true,
+      constructionBuildActive: false,
       terraformEditCheckbox: null,
       weatherStatsController: null,
       naadfStatsController: null,
@@ -136,6 +141,7 @@ export function createUiStartupContext(input: UiStartupInput): UiStartupContext 
       digRadiusController: null,
       playerInputController: null,
       playerModeController: null,
+      combatController: null,
     },
   };
 }

@@ -95,7 +95,7 @@ describe("dig edits in the density field", () => {
 
   it("carves air inside the sphere and leaves the far field untouched", () => {
     const x = 5, z = 5;
-    const y = surfaceHeight(x, z) - 1; // just below the surface: solid
+    const y = surfaceHeight(x, z) - 1;
     expect(density(x, y, z)).toBeGreaterThan(0);
     addDigEdit({ x, y, z, r: 3 });
     expect(density(x, y, z)).toBeLessThan(0);
@@ -104,18 +104,16 @@ describe("dig edits in the density field", () => {
 
   it("respects the bedrock guard", () => {
     addDigEdit({ x: 5, y: 0, z: 5, r: 3 });
-    expect(density(5, 1, 5)).toBeGreaterThan(0); // y <= bedrock: untouched
-    expect(density(5, 2, 5)).toBeLessThan(0); // above bedrock, inside sphere: air
+    expect(density(5, 1, 5)).toBeGreaterThan(0);
+    expect(density(5, 2, 5)).toBeLessThan(0);
   });
 
   it("raise deposits solid above the surface and tags it with the chosen material", () => {
     const x = 30, z = 30;
     const sy = surfaceHeight(x, z);
-    expect(density(x, sy + 2, z)).toBeLessThan(0); // above the surface: air before
+    expect(density(x, sy + 2, z)).toBeLessThan(0);
     addDigEdit({ x, y: sy, z, r: 4, op: "add", material: 2 });
-    expect(density(x, sy + 2, z)).toBeGreaterThan(0); // raised: now solid
-
-    // deposited vertices carry a one-hot weight on the chosen slot; far field stays natural
+    expect(density(x, sy + 2, z)).toBeGreaterThan(0);
     expect(paintMaterialAt(x, sy, z)).toBe(3);
     expect(paintMaterialAt(x + 50, sy, z)).toBe(0);
   });
@@ -141,22 +139,21 @@ describe("dig edits in the density field", () => {
 
   it("strength scales how much an edit moves the field", () => {
     const x = 40, z = 40;
-    const y = surfaceHeight(x, z) - 1; // solid
+    const y = surfaceHeight(x, z) - 1;
     const base = density(x, y, z);
     expect(base).toBeGreaterThan(0);
 
     addDigEdit({ x, y, z, r: 3, strength: 0 });
-    expect(density(x, y, z)).toBeCloseTo(base); // 0 strength is a no-op
+    expect(density(x, y, z)).toBeCloseTo(base);
     clearDigEdits();
 
     addDigEdit({ x, y, z, r: 3, strength: 0.5 });
     const half = density(x, y, z);
     clearDigEdits();
 
-    addDigEdit({ x, y, z, r: 3 }); // full (default strength 1)
+    addDigEdit({ x, y, z, r: 3 });
     const full = density(x, y, z);
 
-    // a half-strength carve lands between untouched and full
     expect(half).toBeLessThan(base);
     expect(half).toBeGreaterThan(full);
   });
@@ -164,31 +161,28 @@ describe("dig edits in the density field", () => {
   it("brush height extends the vertical reach independent of radius", () => {
     const x = 45, z = 45;
     const sy = surfaceHeight(x, z);
-    const y = sy - 10; // 10 cells below the surface
+    const y = sy - 10;
 
-    // a radius-2 cylinder (height defaults to 2) can't reach this deep
     addDigEdit({ x, y: sy, z, r: 2, shape: "cylinder" });
-    expect(density(x, y, z)).toBeGreaterThan(0); // still solid
+    expect(density(x, y, z)).toBeGreaterThan(0);
     clearDigEdits();
 
-    // same radius, but tall enough to carve down to it
     addDigEdit({ x, y: sy, z, r: 2, shape: "cylinder", height: 14 });
-    expect(density(x, y, z)).toBeLessThan(0); // now air
+    expect(density(x, y, z)).toBeLessThan(0);
   });
 
   it("cube and cylinder brushes carve their own footprint (not the sphere's)", () => {
     const x = 60, z = 60;
-    const y = surfaceHeight(x, z) - 6; // solidly underground
+    const y = surfaceHeight(x, z) - 6;
     const r = 4;
-    // a corner of the radius-r box, well outside the inscribed sphere (|offset| ≈ 1.56r)
     const cx = x + 0.9 * r, cy = y + 0.9 * r, cz = z + 0.9 * r;
 
     addDigEdit({ x, y, z, r, shape: "sphere" });
-    expect(density(cx, cy, cz)).toBeGreaterThan(0); // sphere doesn't reach the corner
+    expect(density(cx, cy, cz)).toBeGreaterThan(0);
     clearDigEdits();
 
     addDigEdit({ x, y, z, r, shape: "cube" });
-    expect(density(cx, cy, cz)).toBeLessThan(0); // cube does
+    expect(density(cx, cy, cz)).toBeLessThan(0);
   });
 });
 
@@ -204,7 +198,6 @@ describe("rebuildDirtyPages", () => {
     const b = lod0.find((n) => n.id === "L0:1,0")!;
     const trisBefore = a.mesh.indices.length;
 
-    // dig across the x=32 page border, well inside the z extent of the bottom row
     const x = 32, z = 16;
     const y = surfaceHeight(x, z);
     const r = 3;
@@ -215,11 +208,9 @@ describe("rebuildDirtyPages", () => {
       cfg,
     );
 
-    expect(rebuild.lod0Pages).toBe(2); // pages (0,0) and (1,0)
-    expect(rebuild.parentNodes).toBe(1); // the single LOD1 root
+    expect(rebuild.lod0Pages).toBe(2);
+    expect(rebuild.parentNodes).toBe(1);
     expect(a.mesh.indices.length).not.toBe(trisBefore);
-
-    // the dug border chain must still match exactly between the two pages (gate A2)
     assertBorderMatch(
       borderChain(a.mesh, "x", 32, a.footprint),
       borderChain(b.mesh, "x", 32, b.footprint),
@@ -232,10 +223,8 @@ describe("rebuildDirtyPages", () => {
     const a = lod0.find((n) => n.id === "L0:0,0")!;
     const b = lod0.find((n) => n.id === "L0:1,0")!;
 
-    // raise solid (painted material 1) across the x=32 page border
     const x = 32, z = 16, r = 4;
     addDigEdit({ x, y: surfaceHeight(x, z), z, r, op: "add", material: 1 });
-    // a per-edit material mismatch at the seam would hard-fail the weld here
     const rebuild = rebuildDirtyPages(
       result,
       { minX: x - r - 4, maxX: x + r + 4, minZ: z - r - 4, maxZ: z + r + 4 },
@@ -255,10 +244,9 @@ describe("rebuildDirtyPages", () => {
     const trisBefore = node.mesh.indices.length;
 
     const x = 16, z = 16;
-    const y = surfaceHeight(x, z) - 12; // fully below the surface band
+    const y = surfaceHeight(x, z) - 12;
     const r = 4;
     addDigEdit({ x, y, z, r });
-    // rebuild throws ClodBuildError on any weld conflict / open internal border
     const rebuild = rebuildDirtyPages(
       result,
       { minX: x - r - 4, maxX: x + r + 4, minZ: z - r - 4, maxZ: z + r + 4 },
@@ -269,12 +257,11 @@ describe("rebuildDirtyPages", () => {
     expect(node.mesh.indices.length).toBeGreaterThan(trisBefore);
   });
 
-  it("per-chunk rebuild re-meshes only the touched chunks, identical to a full page rebuild", () => {
+  it("per-chunk rebuild avoids reporting clean sibling pages", () => {
     const world = { cellsX: 2 * cfg.page.chunks_per_page * cfg.page.chunk_size, cellsZ: 2 * cfg.page.chunks_per_page * cfg.page.chunk_size };
     const result = buildWorld(2, 2, cfg);
     const node = result.nodesByLevel.get(0)!.find((n) => n.id === "L0:0,0")!;
 
-    // dig deep inside chunk (0,0) so its 6-cell reach can't touch the other 3 chunks
     const x = 6, z = 6, r = 2;
     const y = surfaceHeight(x, z) - 4;
     addDigEdit({ x, y, z, r });
@@ -282,11 +269,35 @@ describe("rebuildDirtyPages", () => {
     const dirty = { minX: x - margin, maxX: x + margin, minZ: z - margin, maxZ: z + margin };
 
     const lod0 = rebuildDirtyLod0Pages(result, dirty, cfg, buildNodeIndex(result));
-    expect(lod0.chunksTotal).toBe(cfg.page.chunks_per_page ** 2); // 4 chunks in the page
-    expect(lod0.chunksRemeshed).toBe(1); // only chunk (0,0)
+    expect(lod0.lod0Pages).toBe(1);
+    expect(lod0.chunksTotal).toBe(cfg.page.chunks_per_page ** 2 * 4);
+    expect(lod0.chunksRemeshed).toBe(cfg.page.chunks_per_page ** 2);
+    expect(lod0.chunksRemeshed).toBeLessThan(lod0.chunksTotal);
 
-    // the per-chunk welded page must equal a from-scratch full extract of the same page
     const full = buildLod0PageSource(0, 0, cfg, world);
+    expect(node.mesh.positions).toEqual(full.mesh.positions);
+    expect(node.mesh.indices).toEqual(full.mesh.indices);
+    expect(node.mesh.normals).toEqual(full.mesh.normals);
+  });
+
+  it("per-chunk rebuild remeshes a true subset inside a 4x4 page", () => {
+    const world = { cellsX: 4 * uiCfg.page.chunks_per_page * uiCfg.page.chunk_size, cellsZ: 4 * uiCfg.page.chunks_per_page * uiCfg.page.chunk_size };
+    const result = buildWorld(4, 4, uiCfg);
+    const node = result.nodesByLevel.get(0)!.find((n) => n.id === "L0:0,0")!;
+
+    const x = 8, z = 8, r = 2;
+    const y = surfaceHeight(x, z) - 4;
+    addDigEdit({ x, y, z, r });
+    const margin = r + 4;
+    const dirty = { minX: x - margin, maxX: x + margin, minZ: z - margin, maxZ: z + margin };
+
+    const lod0 = rebuildDirtyLod0Pages(result, dirty, uiCfg, buildNodeIndex(result));
+    expect(lod0.lod0Pages).toBe(1);
+    expect(lod0.chunksTotal).toBe(uiCfg.page.chunks_per_page ** 2 * 4);
+    expect(lod0.chunksRemeshed).toBe(4);
+    expect(lod0.chunksRemeshed).toBeLessThan(uiCfg.page.chunks_per_page ** 2);
+
+    const full = buildLod0PageSource(0, 0, uiCfg, world);
     expect(node.mesh.positions).toEqual(full.mesh.positions);
     expect(node.mesh.indices).toEqual(full.mesh.indices);
     expect(node.mesh.normals).toEqual(full.mesh.normals);

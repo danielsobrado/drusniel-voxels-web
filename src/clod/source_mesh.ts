@@ -4,7 +4,9 @@ import { PageMesh, PageFootprint, ClodBuildError, triangleCount } from "../types
 import { ClodPagesConfig } from "../config.js";
 import { meshChunk, WorldBounds } from "../terrain/terrain.js";
 import { weldVertices, WeldReport } from "./weld.js";
-import { assertMaterialWeights } from "../material/material_weights.js";
+import { filterPageSourceSections } from "./pageSource.js";
+import type { PageSourceSection as PageSourceMeshSection } from "./pageSourceSections.js";
+import { validatePageMesh } from "./validate.js";
 
 /** Sections that may appear in render meshes but must never enter the CLOD page source path. */
 export type PageSourceSection =
@@ -66,41 +68,6 @@ export interface PageSource {
   chunks: PageMesh[];
 }
 
-/** Concatenate several PageMeshes into one buffer (no welding yet). */
-export function concat(meshes: PageMesh[]): PageMesh {
-  let nv = 0, ni = 0;
-  let ws = 0;
-  for (const m of meshes) {
-    nv += m.positions.length / 3;
-    ni += m.indices.length;
-    if (m.materialWeightStride > ws) ws = m.materialWeightStride;
-  }
-  if (ws === 0) ws = 4;
-  const positions = new Float32Array(nv * 3);
-  const normals = new Float32Array(nv * 3);
-  const materials = new Float32Array(nv);
-  const materialWeights = new Float32Array(nv * ws);
-  const indices = new Uint32Array(ni);
-  let vOff = 0, iOff = 0;
-  for (const m of meshes) {
-    assertMaterialWeights(m, "concat input");
-    positions.set(m.positions, vOff * 3);
-    normals.set(m.normals, vOff * 3);
-    materials.set(m.paintSlots, vOff);
-    for (let j = 0; j < m.positions.length / 3; j++) {
-      for (let k = 0; k < ws; k++) {
-        materialWeights[(vOff + j) * ws + k] = j < m.positions.length / 3 && k < m.materialWeightStride
-          ? m.materialWeights[j * m.materialWeightStride + k]
-          : k === 0 ? 1.0 : 0.0;
-      }
-    }
-    for (let i = 0; i < m.indices.length; i++) indices[iOff + i] = m.indices[i] + vOff;
-    vOff += m.positions.length / 3;
-    iOff += m.indices.length;
-  }
-  return { positions, normals, paintSlots: materials, materialWeights, materialWeightStride: ws, indices };
-}
-
 /**
  * Build a LOD0 page source from its PxP chunks (page coords pageX,pageZ).
  * Step order mirrors §11.2: require PxP chunks -> concat (origins already applied in
@@ -130,11 +97,7 @@ export function buildLod0PageSource(
   const purity = validatePageSourcePurity(chunks, chunkSections);
   assertPageSourceTerrainOnly(purity);
 
-  const { mesh, report } = weldVertices(concat(chunks), cfg.simplify.weld_epsilon_cells, {
-    position: cfg.validation.position_epsilon,
-    normalDot: cfg.validation.normal_dot_min,
-    material: cfg.validation.material_weight_epsilon,
-  });
+  const { mesh, report } = weldChunkMeshes(chunks, cfg);
 
   const footprint: PageFootprint = {
     minX: pageX * P * S,
@@ -180,15 +143,31 @@ export function dirtyPageChunkIndices(
       }
     }
   }
-  return out;
+  return expandChunkNeighborRing(out, P);
+}
+
+/** Re-mesh the 3x3 neighborhood around every dirty chunk so shared border/corner vertices
+ *  are extracted from the same density field. Partial remesh of only the dirty chunk leaves
+ *  stale neighbor normals that weld within epsilon but fail the normal-dot gate. */
+export function expandChunkNeighborRing(indices: readonly number[], chunksPerPage: number): number[] {
+  const P = chunksPerPage;
+  const out = new Set(indices);
+  for (const li of indices) {
+    const dx = li % P, dz = (li / P) | 0;
+    for (let ndz = dz - 1; ndz <= dz + 1; ndz++) {
+      for (let ndx = dx - 1; ndx <= dx + 1; ndx++) {
+        if (ndx >= 0 && ndx < P && ndz >= 0 && ndz < P) out.add(ndz * P + ndx);
+      }
+    }
+  }
+  return [...out];
 }
 
 /**
  * Re-mesh only the chunks of a cached page that `dirty` can perturb, mutating `chunkMeshes`
- * in place, then re-weld the whole page. The welded result is identical to a full
- * {@link buildLod0PageSource} because the unchanged chunks keep their exact vertices and the
- * weld is a pure function of the concatenated chunk meshes. Returns the assembled mesh and
- * how many chunks were re-extracted (for edit-cost telemetry).
+ * in place, then re-weld the whole page. If the partial result violates page validation,
+ * fall back to a full-page remesh. This preserves correctness while allowing the common
+ * small-brush path to update far fewer chunks than a full page rebuild.
  */
 export function rebuildPageChunks(
   chunkMeshes: PageMesh[],
@@ -199,15 +178,66 @@ export function rebuildPageChunks(
   dirty: DirtyChunkBounds,
 ): { mesh: PageMesh; remeshed: number } {
   const P = cfg.page.chunks_per_page;
-  const indices = dirtyPageChunkIndices(pageX, pageZ, cfg, dirty);
-  for (const li of indices) {
-    const dx = li % P, dz = (li / P) | 0;
-    chunkMeshes[li] = meshChunk(pageX * P + dx, pageZ * P + dz, cfg, world);
+  const toRemesh = dirtyPageChunkIndices(pageX, pageZ, cfg, dirty);
+  const footprint = pageFootprint(pageX, pageZ, cfg);
+
+  if (toRemesh.length === 0) {
+    const { mesh } = weldChunkMeshes(chunkMeshes, cfg);
+    validatePageMesh(mesh, footprint, cfg.validation.zero_area_epsilon, `L0:${pageX},${pageZ} unchanged-page weld`);
+    return { mesh, remeshed: 0 };
   }
-  const { mesh } = weldVertices(concat(chunkMeshes), cfg.simplify.weld_epsilon_cells, {
+
+  for (const li of toRemesh) remeshChunk(chunkMeshes, li, pageX, pageZ, cfg, world);
+
+  try {
+    const { mesh } = weldChunkMeshes(chunkMeshes, cfg);
+    validatePageMesh(mesh, footprint, cfg.validation.zero_area_epsilon, `L0:${pageX},${pageZ} partial edit-rebuild`);
+    return { mesh, remeshed: toRemesh.length };
+  } catch {
+    for (let li = 0; li < P * P; li++) remeshChunk(chunkMeshes, li, pageX, pageZ, cfg, world);
+    const { mesh } = weldChunkMeshes(chunkMeshes, cfg);
+    validatePageMesh(mesh, footprint, cfg.validation.zero_area_epsilon, `L0:${pageX},${pageZ} full edit-rebuild fallback`);
+    return { mesh, remeshed: P * P };
+  }
+}
+
+function remeshChunk(
+  chunkMeshes: PageMesh[],
+  localIndex: number,
+  pageX: number,
+  pageZ: number,
+  cfg: ClodPagesConfig,
+  world: WorldBounds,
+): void {
+  const P = cfg.page.chunks_per_page;
+  const dx = localIndex % P;
+  const dz = (localIndex / P) | 0;
+  chunkMeshes[localIndex] = meshChunk(pageX * P + dx, pageZ * P + dz, cfg, world);
+}
+
+function pageFootprint(pageX: number, pageZ: number, cfg: ClodPagesConfig): PageFootprint {
+  const P = cfg.page.chunks_per_page;
+  const S = cfg.page.chunk_size;
+  return {
+    minX: pageX * P * S,
+    minZ: pageZ * P * S,
+    maxX: (pageX + 1) * P * S,
+    maxZ: (pageZ + 1) * P * S,
+  };
+}
+
+function weldChunkMeshes(chunks: readonly PageMesh[], cfg: ClodPagesConfig): { mesh: PageMesh; report: WeldReport } {
+  const sections: PageSourceMeshSection[] = chunks.map((mesh, index) => ({
+    kind: "mainTerrain",
+    terrainClass: "inland",
+    positionSource: "extracted",
+    label: `chunk-${index}`,
+    mesh,
+  }));
+  const filtered = filterPageSourceSections(sections);
+  return weldVertices(filtered.mesh, cfg.simplify.weld_epsilon_cells, {
     position: cfg.validation.position_epsilon,
     normalDot: cfg.validation.normal_dot_min,
     material: cfg.validation.material_weight_epsilon,
   });
-  return { mesh, remeshed: indices.length };
 }

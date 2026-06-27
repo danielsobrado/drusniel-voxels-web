@@ -6,7 +6,6 @@ import {
   baseSurfaceHeight,
   getDigEditRevision,
   getVoxelEditSnapshot,
-  replaceDigEdits,
   replaceVoxelEdits,
   setTerrainSurfaceOverride,
   setBorderCoastRuntime,
@@ -52,7 +51,7 @@ import {
   type WaterConfig,
 } from "../../water/index.js";
 import type { ClodPageNode } from "../../types.js";
-import type { ProjectArchiveContents } from "../../project/project_archive.js";
+import type { VoxelProjectArchiveContents } from "../../project/voxel_project_archive.js";
 import type { ClodRuntimeConfig } from "../runtime_config.js";
 import { updateClodOverlay } from "../../ui/overlay_panel.js";
 import configText from "../../../config/clod_pages.yaml?raw";
@@ -78,7 +77,7 @@ import { parseBorderOceanSceneConfig } from "../../debug/border_ocean_scene.js";
 import { splitWorldBuildNodes } from "./world_build_nodes.js";
 
 export interface WorldBuildStartupInput {
-  stagedImport: ProjectArchiveContents | null;
+  stagedImport: VoxelProjectArchiveContents | null;
   clodRuntime: ClodRuntimeConfig;
   searchParams: URLSearchParams;
   queryGrassPerfScene: boolean;
@@ -121,11 +120,9 @@ export interface WorldBuildResult {
   buildStatus: { value: string };
 }
 
-function importedVoxelSnapshot(stagedImport: ProjectArchiveContents | null): VoxelEditSnapshot | null {
-  const snapshot = (stagedImport?.manifest as { voxelTerrainEdits?: unknown } | undefined)?.voxelTerrainEdits;
-  if (!snapshot || typeof snapshot !== "object") return null;
-  const candidate = snapshot as VoxelEditSnapshot;
-  return Array.isArray(candidate.deltas) && Number.isFinite(candidate.revision) ? candidate : null;
+function importedVoxelSnapshot(stagedImport: VoxelProjectArchiveContents | null): VoxelEditSnapshot {
+  if (!stagedImport) return { revision: 0, deltas: [] };
+  return stagedImport.manifest.voxelTerrainEdits;
 }
 
 export async function runWorldBuildStartup(input: WorldBuildStartupInput): Promise<WorldBuildResult> {
@@ -194,9 +191,7 @@ export async function runWorldBuildStartup(input: WorldBuildStartupInput): Promi
       worldCells,
     );
   }
-  if (isRiverParityTestScene(searchParams.get("scene"))) {
-    waterConfig = applyRiverParityTestWaterConfig(waterConfig);
-  }
+  if (isRiverParityTestScene(searchParams.get("scene"))) waterConfig = applyRiverParityTestWaterConfig(waterConfig);
   waterConfig = resolveWaterConfig(waterConfig, worldCells);
   setBorderCoastRuntime(borderCoastOceanConfig, worldCells);
 
@@ -219,9 +214,7 @@ export async function runWorldBuildStartup(input: WorldBuildStartupInput): Promi
   if (cacheDisabled) setCacheSessionDisabled(true);
   clearWorkerCacheSnapshot();
 
-  const voxelSnapshot = importedVoxelSnapshot(stagedImport);
-  if (voxelSnapshot) replaceVoxelEdits(voxelSnapshot);
-  else if (stagedImport) replaceDigEdits(stagedImport.manifest.terrainEdits);
+  replaceVoxelEdits(importedVoxelSnapshot(stagedImport));
 
   const preHydrologyTerrain = makeFakeBodyCarvedSampler(waterConfig, { surfaceHeight: baseSurfaceHeight });
   const hydrologySystem = waterConfig.enabled && waterConfig.source === "hydrology" && waterConfig.hydrology.enabled
@@ -246,9 +239,7 @@ export async function runWorldBuildStartup(input: WorldBuildStartupInput): Promi
   const scene = searchParams.get("scene") ?? "default";
   const proceduralTextureHash = await buildProceduralTextureHash(
     proceduralTextureConfig.enabled,
-    proceduralTextureConfig.enabled
-      ? `${proceduralTextureConfig.seed}:${proceduralTextureConfig.noise.resolution}`
-      : null,
+    proceduralTextureConfig.enabled ? `${proceduralTextureConfig.seed}:${proceduralTextureConfig.noise.resolution}` : null,
   );
   const stagedImportHash = await buildStagedImportHash(stagedImport?.manifest ?? null);
   const terrainSource: TerrainSourceInputs = {
@@ -279,10 +270,7 @@ export async function runWorldBuildStartup(input: WorldBuildStartupInput): Promi
     role: "main",
   });
 
-  const buildNote =
-    WORLD >= 16 ? " (worker build; large world may take a while)" :
-    WORLD >= 8 ? " (worker build)" :
-    "";
+  const buildNote = WORLD >= 16 ? " (worker build; large world may take a while)" : WORLD >= 8 ? " (worker build)" : "";
   info.textContent = `building ${WORLD}x${WORLD} world…${buildNote}`;
   buildProgress.hidden = false;
   buildProgressPhase.textContent = `${stagedImport ? "import: " : ""}building ${WORLD}x${WORLD}`;
@@ -308,12 +296,7 @@ export async function runWorldBuildStartup(input: WorldBuildStartupInput): Promi
   const { lod0Nodes, allNodes } = splitWorldBuildNodes(result.nodesByLevel);
   const maxTerrainLevel = Math.max(...result.nodesByLevel.keys());
   const worldSizeCells = WORLD * cfg.page.chunks_per_page * cfg.page.chunk_size;
-  const summaryResult = await loadTerrainSummaryWithCacheSimple(
-    lod0Nodes,
-    worldSizeCells,
-    8,
-    cacheCtx,
-  );
+  const summaryResult = await loadTerrainSummaryWithCacheSimple(lod0Nodes, worldSizeCells, 8, cacheCtx);
   const terrainSummary = summaryResult.summary;
   publishTerrainSummaryForDiagnostics(terrainSummary);
   if (cacheCtx) createCacheDebugOverlay();

@@ -1,6 +1,9 @@
 import { load } from "js-yaml";
 import type { FarClipmapRingConfig } from "./types.js";
 
+export type NaadfTraversalMode = "dense" | "hdda" | "compare";
+export type NaadfFarShellHeightSamplingMode = "gpu" | "cpu";
+
 export interface NaadfWorldConfig {
   seed: number;
   chunkSizeCells: number;
@@ -51,12 +54,22 @@ export interface NaadfQueryConfig {
   unknownCountsAsBlockedForSun: boolean;
 }
 
+export interface NaadfTraversalConfig {
+  mode: NaadfTraversalMode;
+  hddaUseDirectionalBounds: boolean;
+  hddaMaxChunkSteps: number;
+  hddaMaxBlockSteps: number;
+  hddaMaxVoxelSteps: number;
+  compareDistanceEpsilonM: number;
+}
+
 export interface NaadfFarShellConfig {
   mode: string;
   startM: number;
   endM: number;
   gridRes: number;
   useNaadfSummary: boolean;
+  heightSamplingMode: NaadfFarShellHeightSamplingMode;
 }
 
 export interface NaadfDebugConfig {
@@ -100,10 +113,14 @@ export interface NaadfPocConfig {
   mipSummary: NaadfMipSummaryConfig;
   farClipmap: NaadfFarClipmapConfig;
   query: NaadfQueryConfig;
+  traversal: NaadfTraversalConfig;
   farShell: NaadfFarShellConfig;
   debug: NaadfDebugConfig;
   acceptance: NaadfAcceptanceConfig;
 }
+
+const TRAVERSAL_MODES: ReadonlySet<NaadfTraversalMode> = new Set(["dense", "hdda", "compare"]);
+const FAR_SHELL_HEIGHT_MODES: ReadonlySet<NaadfFarShellHeightSamplingMode> = new Set(["gpu", "cpu"]);
 
 function requireNumber(value: unknown, path: string, min?: number): number {
   if (typeof value !== "number" || !Number.isFinite(value)) {
@@ -115,6 +132,10 @@ function requireNumber(value: unknown, path: string, min?: number): number {
   return value;
 }
 
+function optionalNumber(value: unknown, path: string, defaultValue: number, min?: number): number {
+  return value === undefined ? defaultValue : requireNumber(value, path, min);
+}
+
 function requireBool(value: unknown, path: string): boolean {
   if (typeof value !== "boolean") {
     throw new Error(`NAADF config: expected boolean at ${path}, got ${String(value)}`);
@@ -122,11 +143,31 @@ function requireBool(value: unknown, path: string): boolean {
   return value;
 }
 
+function optionalBool(value: unknown, path: string, defaultValue: boolean): boolean {
+  return value === undefined ? defaultValue : requireBool(value, path);
+}
+
 function requireString(value: unknown, path: string): string {
   if (typeof value !== "string") {
     throw new Error(`NAADF config: expected string at ${path}, got ${String(value)}`);
   }
   return value;
+}
+
+function requireTraversalMode(value: unknown, path: string): NaadfTraversalMode {
+  const mode = requireString(value, path);
+  if (!TRAVERSAL_MODES.has(mode as NaadfTraversalMode)) {
+    throw new Error(`NAADF config: ${path} must be dense, hdda, or compare, got ${mode}`);
+  }
+  return mode as NaadfTraversalMode;
+}
+
+function requireFarShellHeightMode(value: unknown, path: string): NaadfFarShellHeightSamplingMode {
+  const mode = requireString(value, path);
+  if (!FAR_SHELL_HEIGHT_MODES.has(mode as NaadfFarShellHeightSamplingMode)) {
+    throw new Error(`NAADF config: ${path} must be gpu or cpu, got ${mode}`);
+  }
+  return mode as NaadfFarShellHeightSamplingMode;
 }
 
 function parseRing(raw: Record<string, unknown>, path: string): FarClipmapRingConfig {
@@ -141,6 +182,14 @@ function parseRing(raw: Record<string, unknown>, path: string): FarClipmapRingCo
 function requireSection(raw: unknown, name: string): Record<string, unknown> {
   if (!raw || typeof raw !== "object") {
     throw new Error(`NAADF config: missing required section '${name}'`);
+  }
+  return raw as Record<string, unknown>;
+}
+
+function optionalSection(raw: unknown): Record<string, unknown> {
+  if (raw === undefined) return {};
+  if (!raw || typeof raw !== "object") {
+    throw new Error("NAADF config: optional section must be an object when present");
   }
   return raw as Record<string, unknown>;
 }
@@ -161,6 +210,7 @@ export function parseNaadfPocConfig(yamlText: string): NaadfPocConfig {
   const mipRaw = requireSection(cfg["mip_summary"], "mip_summary");
   const farRaw = requireSection(cfg["far_clipmap"], "far_clipmap");
   const queryRaw = requireSection(cfg["query"], "query");
+  const traversalRaw = optionalSection(cfg["traversal"]);
   const shellRaw = requireSection(cfg["far_shell"], "far_shell");
   const debugRaw = requireSection(cfg["debug"], "debug");
   const acceptRaw = requireSection(cfg["acceptance"], "acceptance");
@@ -235,12 +285,21 @@ export function parseNaadfPocConfig(yamlText: string): NaadfPocConfig {
       farSummaryLodBias: requireNumber(queryRaw["far_summary_lod_bias"], "query.far_summary_lod_bias"),
       unknownCountsAsBlockedForSun: requireBool(queryRaw["unknown_counts_as_blocked_for_sun"], "query.unknown_counts_as_blocked_for_sun"),
     },
+    traversal: {
+      mode: requireTraversalMode(traversalRaw["mode"] ?? "dense", "traversal.mode"),
+      hddaUseDirectionalBounds: optionalBool(traversalRaw["hdda_use_directional_bounds"], "traversal.hdda_use_directional_bounds", false),
+      hddaMaxChunkSteps: optionalNumber(traversalRaw["hdda_max_chunk_steps"], "traversal.hdda_max_chunk_steps", 512, 1),
+      hddaMaxBlockSteps: optionalNumber(traversalRaw["hdda_max_block_steps"], "traversal.hdda_max_block_steps", 2048, 1),
+      hddaMaxVoxelSteps: optionalNumber(traversalRaw["hdda_max_voxel_steps"], "traversal.hdda_max_voxel_steps", 4096, 1),
+      compareDistanceEpsilonM: optionalNumber(traversalRaw["compare_distance_epsilon_m"], "traversal.compare_distance_epsilon_m", 0.001, 0),
+    },
     farShell: {
       mode: requireString(shellRaw["mode"], "far_shell.mode"),
       startM: requireNumber(shellRaw["start_m"], "far_shell.start_m", 0),
       endM: requireNumber(shellRaw["end_m"], "far_shell.end_m", 0),
       gridRes: requireNumber(shellRaw["grid_res"], "far_shell.grid_res", 1),
       useNaadfSummary: requireBool(shellRaw["use_naadf_summary"], "far_shell.use_naadf_summary"),
+      heightSamplingMode: requireFarShellHeightMode(shellRaw["height_sampling_mode"] ?? "cpu", "far_shell.height_sampling_mode"),
     },
     debug: {
       enabled: requireBool(debugRaw["enabled"], "debug.enabled"),

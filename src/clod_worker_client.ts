@@ -1,5 +1,5 @@
 import type { BuildProgress, BuildResult, DirtyCellBounds } from "./clod/quadtree.js";
-import type { DigEdit } from "./terrain/terrain.js";
+import type { DigEdit, VoxelEditSnapshot } from "./terrain/terrain.js";
 import type { BorderCoastOceanConfig } from "./terrain/border_coast_config.js";
 import type { ClodPageNode } from "./types.js";
 import type { ClodPagesConfig } from "./config.js";
@@ -17,6 +17,8 @@ import {
   type SerializedParentBatch,
 } from "./clod_worker_protocol.js";
 
+const MAX_DIG_EDITS_PER_WORKER_BATCH = 8;
+
 export interface WorkerLod0Rebuild {
   changed: ClodPageNode[];
   dirtyCoords: [number, number][];
@@ -27,6 +29,7 @@ export interface WorkerLod0Rebuild {
   chunksRemeshed: number;
   chunksTotal: number;
   pendingParents: number;
+  requestCount: number;
 }
 
 export interface WorkerParentBatch {
@@ -44,17 +47,8 @@ interface PendingRequest<T> {
 
 interface DigBatchSlot {
   edits: DigEdit[];
-  dirty: DirtyCellBounds;
+  dirtyRegions: DirtyCellBounds[];
   resolvers: Array<PendingRequest<WorkerLod0Rebuild>>;
-}
-
-function mergeDirty(a: DirtyCellBounds, b: DirtyCellBounds): DirtyCellBounds {
-  return {
-    minX: Math.min(a.minX, b.minX),
-    maxX: Math.max(a.maxX, b.maxX),
-    minZ: Math.min(a.minZ, b.minZ),
-    maxZ: Math.max(a.maxZ, b.maxZ),
-  };
 }
 
 export class ClodWorkerClient {
@@ -95,7 +89,7 @@ export class ClodWorkerClient {
     worldPagesX: number,
     worldPagesZ: number,
     cfg: ClodPagesConfig,
-    edits: DigEdit[],
+    voxelEdits: VoxelEditSnapshot,
     onProgress: (progress: BuildProgress) => void,
     hydrologyTerrain: SerializedHydrologyTerrain | null = null,
     borderCoastOceanConfig: BorderCoastOceanConfig | null = null,
@@ -109,7 +103,7 @@ export class ClodWorkerClient {
       worldPagesX,
       worldPagesZ,
       cfg,
-      edits,
+      voxelEdits,
       hydrologyTerrain,
       borderCoastOceanConfig,
       cacheDisabled,
@@ -127,12 +121,12 @@ export class ClodWorkerClient {
       if (!this.digPending) {
         this.digPending = {
           edits: [edit],
-          dirty: { ...dirty },
+          dirtyRegions: [{ ...dirty }],
           resolvers: [{ resolve, reject }],
         };
       } else {
         this.digPending.edits.push(edit);
-        this.digPending.dirty = mergeDirty(this.digPending.dirty, dirty);
+        this.digPending.dirtyRegions.push({ ...dirty });
         this.digPending.resolvers.push({ resolve, reject });
       }
       void this.pumpDigQueue();
@@ -177,12 +171,13 @@ export class ClodWorkerClient {
       while (this.digPending) {
         const batch = this.digPending;
         this.digPending = null;
-        try {
-          const result = await this.sendDigBatch(batch);
-          for (const pending of batch.resolvers) pending.resolve(result);
-          await this.waitForParents();
-        } catch (error) {
-          for (const pending of batch.resolvers) pending.reject(error);
+        for (const part of this.splitDigBatch(batch)) {
+          try {
+            const result = await this.sendDigBatch(part);
+            for (const pending of part.resolvers) pending.resolve(result);
+          } catch (error) {
+            for (const pending of part.resolvers) pending.reject(error);
+          }
         }
       }
     } finally {
@@ -191,19 +186,26 @@ export class ClodWorkerClient {
     }
   }
 
+  private splitDigBatch(batch: DigBatchSlot): DigBatchSlot[] {
+    if (batch.edits.length <= MAX_DIG_EDITS_PER_WORKER_BATCH) return [batch];
+    const out: DigBatchSlot[] = [];
+    for (let start = 0; start < batch.edits.length; start += MAX_DIG_EDITS_PER_WORKER_BATCH) {
+      const end = Math.min(batch.edits.length, start + MAX_DIG_EDITS_PER_WORKER_BATCH);
+      out.push({
+        edits: batch.edits.slice(start, end),
+        dirtyRegions: batch.dirtyRegions.slice(start, end),
+        resolvers: batch.resolvers.slice(start, end),
+      });
+    }
+    return out;
+  }
+
   private sendDigBatch(batch: DigBatchSlot): Promise<WorkerLod0Rebuild> {
     const requestId = this.nextRequestId++;
-    const request: ClodWorkerRequest = { type: "dig", requestId, edits: batch.edits, dirty: batch.dirty };
+    const request: ClodWorkerRequest = { type: "dig", requestId, edits: batch.edits, dirtyRegions: batch.dirtyRegions };
     return new Promise((resolve, reject) => {
       this.digRequests.set(requestId, { resolve, reject });
       this.worker.postMessage(request);
-    });
-  }
-
-  private waitForParents(): Promise<void> {
-    if (!this.parentsPending) return Promise.resolve();
-    return new Promise((resolve) => {
-      this.parentsWaiters.push(resolve);
     });
   }
 
@@ -247,6 +249,7 @@ export class ClodWorkerClient {
           chunksRemeshed: message.chunksRemeshed,
           chunksTotal: message.chunksTotal,
           pendingParents: message.pendingParents,
+          requestCount: message.editCount,
         };
         if (message.pendingParents > 0) this.parentsPending = true;
         for (const rid of message.requestIds) {
@@ -326,13 +329,8 @@ export class ClodWorkerClient {
         pending.reject(error);
         return;
       }
-      // If no matching pending request, the error may be from a parent rebuild
-      // (the dig promise was already resolved). Release parent waiters so
-      // pumpDigQueue does not hang forever.
-      this.releaseParentsWaitersAfterFailure(error);
-      return;
     }
-    this.onError?.(error);
+    this.releaseParentsWaitersAfterFailure(error);
   }
 
   private rejectAll(error: Error): void {
@@ -340,10 +338,6 @@ export class ClodWorkerClient {
     for (const pending of this.digRequests.values()) pending.reject(error);
     for (const pending of this.flushRequests.values()) pending.reject(error);
     for (const pending of this.clearCacheRequests.values()) pending.reject(error);
-    if (this.digPending) {
-      for (const pending of this.digPending.resolvers) pending.reject(error);
-      this.digPending = null;
-    }
     this.buildRequests.clear();
     this.digRequests.clear();
     this.flushRequests.clear();
